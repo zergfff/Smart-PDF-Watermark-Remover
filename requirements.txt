@@ -1,0 +1,4 @@
+PyMuPDF==1.23.26
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.2
+PyQt6-sip==13.6.0
