@@ -17,10 +17,8 @@
 
 ### 环境要求
 - Python 3.8 或更高版本
-- Windows / macOS / Linux
+- Windows
 
 ### 安装步骤
-1. 克隆或下载本项目到本地。
-2. 在项目根目录下打开终端，安装依赖：
-   ```bash
-   pip install -r requirements.txt
+1. 下载release中exe文件到本地。
+2. 执行exe文件。
