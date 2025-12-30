@@ -1,4 +1,4 @@
-# Smart PDF Watermark Remover (智能PDF去水印工具)
+# Extreme_PDF_Cleaner (智能PDF去水印工具)
 
 这是一个基于 Python 开发的桌面应用程序，旨在通过智能分析 PDF 页面结构，识别并批量去除重复出现的“疑似水印”元素（包括图像和文本）。
 
