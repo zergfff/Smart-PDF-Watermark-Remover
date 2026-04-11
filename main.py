@@ -98,35 +98,50 @@ class SettingsDialog(QDialog):
         return self.ratio_spin.value(), self.lang_combo.currentData()
 
 # --- 1. 底层计算逻辑 ---
+def is_bbox_similar(bbox1, bbox2, tolerance=2.0):
+    """判断两个 bbox 是否在容差范围内相似"""
+    return all(abs(a - b) <= tolerance for a, b in zip(bbox1, bbox2))
+
 def analyze_chunk_worker(file_path, page_indices):
     results = []
+    errors = []
     doc = None
     try:
         doc = fitz.open(file_path)
         for i in page_indices:
-            page = doc[i]
-            rect = page.rect
-            pw, ph = round(rect.width, 1), round(rect.height, 1)
-            page_data = {'index': i, 'size_key': (pw, ph), 'imgs': [], 'texts': []}
-            for img in page.get_images():
-                try:
-                    pix = fitz.Pixmap(doc, img[0])
-                    h = xxhash.xxh64(pix.samples).hexdigest()
-                    page_data['imgs'].append({'hash': h, 'xref': img[0]})
-                except: continue
-            blocks = page.get_text("dict")["blocks"]
-            for b in blocks:
-                if b["type"] != 0: continue
-                for line in b["lines"]:
-                    content = "".join([span["text"] for span in line["spans"]]).strip()
-                    if len(content) > 1:
-                        bbox = tuple([round(v, 1) for v in line["bbox"]])
-                        page_data['texts'].append({'text': content, 'bbox': bbox})
-            results.append(page_data)
-    except: pass
+            try:
+                page = doc[i]
+                rect = page.rect
+                pw, ph = round(rect.width, 1), round(rect.height, 1)
+                page_data = {'index': i, 'size_key': (pw, ph), 'imgs': [], 'texts': []}
+                for img in page.get_images():
+                    try:
+                        pix = fitz.Pixmap(doc, img[0])
+                        # 如果图片太大，采样计算哈希以节省内存和时间
+                        if pix.size > 1024 * 1024: # > 1MB
+                            h = xxhash.xxh64(pix.samples[::4]).hexdigest()
+                        else:
+                            h = xxhash.xxh64(pix.samples).hexdigest()
+                        page_data['imgs'].append({'hash': h, 'xref': img[0]})
+                    except Exception as e:
+                        errors.append(f"Page {i} image error: {str(e)}")
+                        continue
+                blocks = page.get_text("dict")["blocks"]
+                for b in blocks:
+                    if b["type"] != 0: continue
+                    for line in b["lines"]:
+                        content = "".join([span["text"] for span in line["spans"]]).strip()
+                        if len(content) > 1:
+                            bbox = tuple([round(v, 1) for v in line["bbox"]])
+                            page_data['texts'].append({'text': content, 'bbox': bbox})
+                results.append(page_data)
+            except Exception as e:
+                errors.append(f"Page {i} general error: {str(e)}")
+    except Exception as e:
+        errors.append(f"Worker file open error: {str(e)}")
     finally:
         if doc: doc.close()
-    return results
+    return results, errors
 
 # --- 2. 交互确认对话框 ---
 class EnhancedWatermarkDialog(QDialog):
@@ -165,25 +180,33 @@ class EnhancedWatermarkDialog(QDialog):
             header_img.setStyleSheet("color: #e74c3c;")
             self.scroll_layout.addWidget(header_img)
             for h, info in img_data.items():
+                QApplication.processEvents() # 保持 UI 响应
                 frame = QFrame(); frame.setFrameStyle(QFrame.Shape.StyledPanel)
                 l = QHBoxLayout(frame); l.setContentsMargins(5, 5, 5, 5)
                 cb = QCheckBox(""); cb.setChecked(False); self.img_boxes[h] = cb
-                pix = fitz.Pixmap(self.doc, info['xref'])
-                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-                lab = QLabel()
-                lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                # 设置 type 为 img
-                lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img"})
-                lab.installEventFilter(self)
-                l.addWidget(cb); l.addWidget(lab); l.addStretch()
-                l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
-                self.scroll_layout.addWidget(frame)
+                try:
+                    pix = fitz.Pixmap(self.doc, info['xref'])
+                    # 如果原图很大，先缩放再转 QImage
+                    if pix.width > 400 or pix.height > 400:
+                        zoom = min(400/pix.width, 400/pix.height)
+                        pix = fitz.Pixmap(pix, fitz.Matrix(zoom, zoom))
+                    qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                    lab = QLabel()
+                    lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img"})
+                    lab.installEventFilter(self)
+                    l.addWidget(cb); l.addWidget(lab); l.addStretch()
+                    l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
+                    self.scroll_layout.addWidget(frame)
+                except Exception as e:
+                    print(f"Error loading img preview: {e}")
 
         if text_blocks:
             header_txt = QLabel(f"<b>{self.t['txt_header']}</b>")
             header_txt.setStyleSheet("color: #3498db;")
             self.scroll_layout.addWidget(header_txt)
             for key, info in text_blocks.items():
+                QApplication.processEvents() # 保持 UI 响应
                 frame = QFrame(); frame.setFrameStyle(QFrame.Shape.StyledPanel)
                 row_layout = QHBoxLayout(frame); row_layout.setContentsMargins(5, 5, 5, 5)
                 cb = QCheckBox(); cb.setChecked(False)
@@ -191,7 +214,8 @@ class EnhancedWatermarkDialog(QDialog):
                 try:
                     sample_page = self.doc[info['sample_page']]
                     clip_rect = fitz.Rect(key[1]) + (-10, -5, 10, 5)
-                    pix = sample_page.get_pixmap(clip=clip_rect, matrix=fitz.Matrix(2, 2))
+                    # 降低预览图精度以加快速度
+                    pix = sample_page.get_pixmap(clip=clip_rect, matrix=fitz.Matrix(1.5, 1.5))
                     qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                     img_lab = QLabel()
                     img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -199,7 +223,8 @@ class EnhancedWatermarkDialog(QDialog):
                     img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": key[1], "type": "txt"})
                     img_lab.installEventFilter(self)
                     row_layout.addWidget(img_lab)
-                except: pass
+                except Exception as e:
+                    print(f"Error loading text preview: {e}")
                 row_layout.addStretch()
                 row_layout.addWidget(QLabel(f"<span style='{TXT_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
                 self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': key[1], 'size': key[2]})
@@ -247,7 +272,8 @@ class EnhancedWatermarkDialog(QDialog):
             painter.drawEllipse(ellipse_rect.x0, ellipse_rect.y0, ellipse_rect.width, ellipse_rect.height)
             painter.end()
             self.location_preview.setPixmap(pixmap)
-        except: pass
+        except Exception as e:
+            self.location_preview.setText(f"Preview error: {e}")
 
     def select_all(self):
         for cb in self.img_boxes.values(): cb.setChecked(True)
@@ -290,7 +316,9 @@ class MasterWorker(QThread):
             with ProcessPoolExecutor(max_workers=cpu_count) as executor:
                 futures = [executor.submit(analyze_chunk_worker, self.file_path, r) for r in ranges]
                 for i, f in enumerate(futures):
-                    all_page_results.extend(f.result())
+                    res, errs = f.result()
+                    all_page_results.extend(res)
+                    for e in errs: self.log_signal.emit(f"Worker Warning: {e}")
                     self.log_signal.emit(f">>> Scanning progress: {int((i+1)/len(futures)*100)}%")
 
             size_groups = {}
@@ -342,7 +370,8 @@ class MasterWorker(QThread):
                         txt = "".join([s["text"] for s in line["spans"]]).strip()
                         bbox = tuple([round(v, 1) for v in line["bbox"]])
                         for conf in self.confirmed_texts:
-                            if txt == conf['text'] and bbox == conf['bbox'] and cur_size == conf['size']:
+                            # 使用模糊匹配替代精确匹配
+                            if txt == conf['text'] and cur_size == conf['size'] and is_bbox_similar(bbox, conf['bbox']):
                                 page.add_redact_annot(line["bbox"])
                 page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
                 self.progress.emit(int((i + 1) / total * 100))
@@ -441,7 +470,8 @@ class UltraAppFinal(QMainWindow):
                 zoom = min(target_w / doc[idx].rect.width, target_h / doc[idx].rect.height)
                 pix = page_data.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
                 lab.setPixmap(QPixmap.fromImage(QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)))
-            except: pass
+            except Exception as e:
+                lab.setText(f"Render error: {e}")
         render_to_label(self.doc_orig, self.lab_orig, self.scroll_orig)
         if self.doc_clean: render_to_label(self.doc_clean, self.lab_clean, self.scroll_clean)
 
