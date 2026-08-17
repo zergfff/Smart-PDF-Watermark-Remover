@@ -613,10 +613,7 @@ class MasterWorker(QThread):
             while not self.is_confirmed: self.msleep(50)
             
             self.log_signal.emit(">>> Applying cleaning process...")
-            # ---- 1) 图片水印：先收集用户确认的图片 xref（哈希反查），
-            #        实际删除放到 pikepdf 阶段用内容流 Do 级删除（兼容 Form 容器内图片） ----
-            tmp_imgs = os.path.join(tempfile.gettempdir(),
-                                    f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
+            # ---- 1) 图片水印：收集用户确认的图片 xref（哈希反查，原始文件）----
             confirmed_xrefs = set()
             for i in range(total):
                 page = doc[i]
@@ -628,25 +625,32 @@ class MasterWorker(QThread):
                     except Exception:
                         continue
                 self.progress.emit(int((i + 1) / total * 50))
-            doc.save(tmp_imgs, garbage=4, deflate=True)
-            doc.close()
 
-            # ---- 2) 文本水印：pikepdf 内容流级删除（只删绘制水印的 BT..ET 块，不碰正文）
-            #        同时 encryption=False 彻底移除加密字典与权限位（禁打印/复制/修改等） ----
+            # ---- 2) pikepdf 内容流级删除（文本 BT..ET 块 + 图片 Do 操作）并去权限 ----
+            #        直接打开原始文件——不能用 fitz 先重写，否则 xref 重编号，
+            #        哈希反查到的图片号会匹配不上导致删除为 0
             keywords = [c['text'].encode('utf-8') for c in self.confirmed_texts]
             removed_total = 0
-            pdf = pikepdf.open(tmp_imgs)
+            img_removed = 0
+            try:
+                pdf = pikepdf.open(self.file_path)
+            except Exception:
+                # 加密等无法直接打开时，退回 fitz 转存后再处理（尽力而为）
+                tmp_imgs = os.path.join(tempfile.gettempdir(),
+                                        f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
+                doc.save(tmp_imgs, garbage=4, deflate=True)
+                pdf = pikepdf.open(tmp_imgs)
+            doc.close()
             for i, page in enumerate(pdf.pages):
                 n = _wm_process_page(pdf, page, keywords)
                 n += _wm_process_xobjects(page.get("/Resources"), keywords)
                 removed_total += n
                 self.progress.emit(50 + int((i + 1) / total * 50))
-            out_tmp = os.path.join(tempfile.gettempdir(),
-                                   f"__wm_final_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
-            img_removed = 0
             if confirmed_xrefs:
                 img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
                 img_removed = _dw.remove_image_watermarks(pdf, img_cand)
+            out_tmp = os.path.join(tempfile.gettempdir(),
+                                   f"__wm_final_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
             pdf.save(out_tmp, encryption=False)
             pdf.close()
             self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
