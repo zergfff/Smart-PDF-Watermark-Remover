@@ -28,8 +28,14 @@ jobs:
       - name: Build CLI (pdf_dewatermark.exe)
         run: python -m PyInstaller -F --clean --name pdf_dewatermark pdf_dewatermark.py
 
-      - name: Build GUI (Extreme_PDF_Cleaner.exe)
+      - name: Build GUI onefile (Extreme_PDF_Cleaner.exe)
         run: python -m PyInstaller -F -w --clean --name Extreme_PDF_Cleaner main.py
+
+      - name: Build GUI onedir (fast startup) + zip
+        run: |
+          python -m PyInstaller -w --clean --distpath dist_dir --workpath build_on --name Extreme_PDF_Cleaner main.py
+          powershell -Command "Compress-Archive -Path 'dist_dir/Extreme_PDF_Cleaner' -DestinationPath 'Extreme_PDF_Cleaner_Portable.zip' -Force"
+          echo "portable zip:" && ls -la Extreme_PDF_Cleaner_Portable.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -37,6 +43,7 @@ jobs:
           name: exes
           path: |
             dist/*.exe
+            Extreme_PDF_Cleaner_Portable.zip
             batch_clean.py
             verify_clean.py
             pixel_check.py
@@ -50,6 +57,7 @@ jobs:
           files: |
             dist/pdf_dewatermark.exe
             dist/Extreme_PDF_Cleaner.exe
+            Extreme_PDF_Cleaner_Portable.zip
             batch_clean.py
             verify_clean.py
             pixel_check.py

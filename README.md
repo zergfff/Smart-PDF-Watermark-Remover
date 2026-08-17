@@ -74,8 +74,13 @@ python batch_clean.py   # 自动识别 原始/ 里每份 PDF 的水印字符串 
 
 ```bash
 pip install pyinstaller
+# 单文件版（方便分享，启动需解压，约 3s）
 pyinstaller -w -F main.py --name Extreme_PDF_Cleaner
+# 目录版（启动最快 ~0.3s，exe 与 _internal 目录需放一起）
+pyinstaller -w main.py --name Extreme_PDF_Cleaner
 ```
+
+> 💡 **启动速度**：想要秒开请用**目录版**（免解压）；单文件版适合单个分享但每次启动要解压 70MB。GitHub Release 同时附带单文件版与目录版 zip。
 
 ## 依赖
 

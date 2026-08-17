@@ -27,6 +27,7 @@ pdf_dewatermark.py — 手搓 PDF 去水印 + 去权限工具（命令行版）
 依赖：pikepdf（必选）、pymupdf（可选，--verify 用）
 """
 import argparse
+import math
 import re
 import sys
 from collections import Counter
@@ -204,6 +205,299 @@ def strip_watermark_stream(data: bytes, keywords: list) -> tuple:
     if new_data.strip() in (b"", b"q", b"Q", b"q\nQ", b"Q\nq"):
         return None, removed
     return new_data, removed
+
+
+# ---------------------------------------------------------------- 几何签名删除
+# 针对 CID/特殊编码字体水印：关键词匹配不到明文时，按"字号+旋转+起点"匹配文本块
+
+def _mmult(m1, m2):
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return [a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
+            c1 * a2 + d1 * c2, c1 * b2 + d1 * d2,
+            e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2]
+
+
+def _ang_diff(a, b):
+    d = (a - b) % 360
+    return min(d, 360 - d)
+
+
+def _block_text_signature(blk: bytes):
+    """解析 BT..ET 块中第一个文本绘制的签名 (字号, 旋转角度, 起点x, 起点y)。
+    无文本则返回 None。"""
+    import math as _math
+    ops = []
+    for m in re.finditer(rb"/[\w.#]+\s+([-\d.]+)\s+Tf", blk):
+        ops.append((m.start(), "Tf", float(m.group(1))))
+    for m in re.finditer(rb"([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm", blk):
+        ops.append((m.start(), "Tm", [float(m.group(i)) for i in range(1, 7)]))
+    for m in re.finditer(rb"([-\d.]+)\s+([-\d.]+)\s+Td", blk):
+        ops.append((m.start(), "Td", [float(m.group(1)), float(m.group(2))]))
+    for m in re.finditer(rb"([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+cm", blk):
+        ops.append((m.start(), "cm", [float(m.group(i)) for i in range(1, 7)]))
+    show = len(blk)
+    for m in re.finditer(rb"\)\s*Tj|\]\s*TJ", blk):
+        show = m.start()
+        break
+    ops.sort(key=lambda x: x[0])
+    M = [1, 0, 0, 1, 0, 0]
+    tm = None
+    size = None
+    for pos, op, val in ops:
+        if pos > show:
+            break
+        if op == "Tf":
+            size = val
+        elif op == "cm":
+            M = _mmult(M, val)
+        elif op == "Tm":
+            tm = list(val)
+        elif op == "Td":
+            if tm is None:
+                tm = [1, 0, 0, 1, 0, 0]
+            tm[4] += val[0]
+            tm[5] += val[1]
+    if tm is None or size is None:
+        return None
+    # 有效字号 = Tf 字号 × Tm 缩放（CJK 字体常见 Tf=1，真实字号在 Tm 里）
+    eff_size = size * tm[0]
+    # combined = M * tm，取旋转与平移
+    a1, b1, c1, d1, e1, f1 = M
+    a2, b2, c2, d2, e2, f2 = tm
+    ca = a1 * a2 + b1 * c2
+    cb = a1 * b2 + b1 * d2
+    ox = e1 * a2 + f1 * c2 + e2
+    oy = e1 * b2 + f1 * d2 + f2
+    rot = _math.degrees(_math.atan2(cb, ca))
+    return (eff_size, rot, ox, oy)
+
+
+def strip_watermark_blocks_geo(data: bytes, targets: list,
+                               tol_size=1.0, tol_rot=6.0, tol_xy=20.0) -> tuple:
+    """按几何签名删除文本块。targets = [(字号, 旋转, 起点x, 起点y), ...]。"""
+    pieces = split_bt_et_pieces(data)
+    kept = []
+    removed = 0
+    for kind, b in pieces:
+        if kind == "block":
+            sig = _block_text_signature(b)
+            hit = False
+            if sig is not None:
+                for tsz, trot, tox, toy in targets:
+                    if (abs(sig[0] - tsz) <= tol_size and
+                            _ang_diff(sig[1], trot) <= tol_rot and
+                            abs(sig[2] - tox) <= tol_xy and
+                            abs(sig[3] - toy) <= tol_xy):
+                        hit = True
+                        break
+            if hit:
+                removed += 1
+                continue
+        kept.append(b)
+    if removed == 0:
+        return data, 0
+    new_data = b"".join(kept)
+    if new_data.strip() in (b"", b"q", b"Q", b"q\nQ", b"Q\nq"):
+        return None, removed
+    return new_data, removed
+
+
+def _scan_do_ctms(data: bytes) -> dict:
+    """扫描内容流：返回 {Form名: [绘制时 CTM, ...]}（考虑 q/Q 状态栈）。"""
+    out = {}
+    M = [1, 0, 0, 1, 0, 0]
+    stack = []
+    nums = []
+    i, n = 0, len(data)
+
+    DELIM = b' \t\r\n()<>[]{}/%'
+    WS = b' \t\r\n'
+
+    while i < n:
+        c = data[i]
+        if c in WS:
+            i += 1
+            continue
+        if c == 0x28:  # 字符串
+            depth = 1
+            i += 1
+            while i < n and depth:
+                if data[i] == 0x5C:
+                    i += 2
+                    continue
+                if data[i] == 0x28:
+                    depth += 1
+                elif data[i] == 0x29:
+                    depth -= 1
+                i += 1
+            continue
+        if c == 0x3C:  # <...>
+            j = data.find(b">", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == 0x2F:  # /名字
+            j = i + 1
+            while j < n and data[j] not in DELIM:
+                j += 1
+            nm = data[i + 1:j]
+            k = j
+            while k < n and data[k] in WS:
+                k += 1
+            if data[k:k + 2] == b"Do":
+                out.setdefault(nm.decode("latin-1", "replace"), []).append(list(M))
+                i = k + 2
+            else:
+                i = j
+            continue
+        if c in b"+-.0123456789":
+            j = i + 1
+            while j < n and data[j] in b"+-.0123456789eE":
+                j += 1
+            try:
+                nums.append(float(data[i:j]))
+            except Exception:
+                pass
+            i = j
+            continue
+        # 操作符
+        if data[i:i + 2] == b"cm" and (i + 2 >= n or data[i + 2] in DELIM) and len(nums) >= 6:
+            M = _mmult(M, nums[-6:])
+            nums = []
+            i += 2
+            continue
+        if data[i:i + 1] == b"q":
+            stack.append(list(M))
+            i += 1
+            continue
+        if data[i:i + 1] == b"Q":
+            if stack:
+                M = stack.pop()
+            i += 1
+            continue
+        j = i + 1
+        while j < n and data[j] not in DELIM:
+            j += 1
+        nums = []  # 其它操作符清空数字缓冲
+        i = j
+    return out
+
+
+def _process_form_geo(obj, m_total, targets):
+    """处理单个 Form 流：块签名经 m_total 变换到页面坐标后与 targets 比较。"""
+    total = 0
+    try:
+        data = obj.read_bytes()
+    except Exception:
+        return 0
+    mf = obj.get("/Matrix")
+    try:
+        M = _mmult(m_total, [float(x) for x in mf]) if mf is not None else list(m_total)
+    except Exception:
+        M = list(m_total)
+    pieces = split_bt_et_pieces(data)
+    kept = []
+    removed = 0
+    for kind, b in pieces:
+        if kind == "block":
+            sig = _block_text_signature(b)
+            hit = False
+            if sig is not None:
+                sz, rot, ox, oy = sig
+                px = M[0] * ox + M[2] * oy + M[4]
+                py = M[1] * ox + M[3] * oy + M[5]
+                rot2 = rot + math.degrees(math.atan2(M[1], M[0]))
+                for tsz, trot, tox, toy in targets:
+                    if (abs(sz - tsz) <= 1.0 and _ang_diff(rot2, trot) <= 6.0 and
+                            abs(px - tox) <= 20.0 and abs(py - toy) <= 20.0):
+                        hit = True
+                        break
+            if hit:
+                removed += 1
+                continue
+        kept.append(b)
+    if removed:
+        new_data = b"".join(kept)
+        if new_data.strip() not in (b"", b"q", b"Q", b"q\nQ", b"Q\nq"):
+            try:
+                obj.write(new_data)
+            except Exception:
+                pass
+        total += removed
+    total += _process_form_children(obj.get("/Resources"), M, targets)
+    return total
+
+
+def _process_form_children(res, m_total, targets):
+    total = 0
+    if res is None:
+        return 0
+    xo = res.get("/XObject")
+    if xo is None:
+        return 0
+    for obj in xo.values():
+        if obj is None:
+            continue
+        try:
+            sub = obj.get("/Subtype")
+        except Exception:
+            continue
+        if sub == pikepdf.Name("/Form"):
+            total += _process_form_geo(obj, m_total, targets)
+    return total
+
+
+def process_page_geo(pdf, page, geo_targets) -> int:
+    """按几何签名删除页面上匹配的水印文本块（含 Form 容器），返回删除块数。
+    geo_targets 使用 fitz 坐标（y 向下）；这里按页高转换到 PDF 坐标（y 向上）。"""
+    if not geo_targets:
+        return 0
+    try:
+        mb = page.mediabox
+        H = float(mb[3]) - float(mb[1])
+    except Exception:
+        H = 842.0
+    targets = [(tsz, -trot, tox, H - toy) for tsz, trot, tox, toy in geo_targets]
+    total = 0
+    contents = page.Contents
+    streams = []
+    if contents is not None:
+        if isinstance(contents, pikepdf.Array):
+            streams = [s for s in contents if s is not None]
+        else:
+            streams = [contents]
+        for s in streams:
+            data = s.read_bytes()
+            new_data, removed = strip_watermark_blocks_geo(data, targets)
+            total += removed
+            if removed:
+                if new_data is None:
+                    continue
+                s.write(new_data)
+    # Form 容器：扫描页面流里各 Form 的绘制 CTM，把 Form 本地坐标变换到页面坐标
+    placements = {}
+    for s in streams:
+        try:
+            for nm, ctms in _scan_do_ctms(s.read_bytes()).items():
+                placements.setdefault(nm, []).extend(ctms)
+        except Exception:
+            pass
+    res = page.get("/Resources")
+    if res is not None:
+        xo = res.get("/XObject")
+        if xo is not None:
+            for name, obj in xo.items():
+                if obj is None:
+                    continue
+                try:
+                    sub = obj.get("/Subtype")
+                except Exception:
+                    continue
+                if sub == pikepdf.Name("/Form"):
+                    ctms = placements.get(name.lstrip('/')) or [None]
+                    for ctm in ctms:
+                        total += _process_form_geo(obj, ctm or [1, 0, 0, 1, 0, 0], targets)
+    return total
 
 
 # ---------------------------------------------------------------- 主流程

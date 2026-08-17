@@ -1,23 +1,32 @@
 import sys
 import os
 import json
+import math
 import tempfile
-import xxhash
 import uuid
-import fitz
-import pikepdf
-import pdf_dewatermark as _dw
+import xxhash
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
                              QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,
                              QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox,
-                             QMenu)
+                             QMenu, QScrollBar, QRubberBand)
 from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize, QRect, QPoint
 
 # --- 环境适配 ---
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+
+# 重型库(占位)：后台线程延迟加载，加快窗口出现
+fitz = None
+pikepdf = None
+_dw = None
+
+def _load_heavy_libs():
+    global fitz, pikepdf, _dw
+    import fitz
+    import pikepdf
+    import pdf_dewatermark as _dw
 
 # --- 多语言配置 ---
 TRANSLATIONS = {
@@ -208,6 +217,7 @@ def is_bbox_similar(bbox1, bbox2, tolerance=2.0):
     return all(abs(a - b) <= tolerance for a, b in zip(bbox1, bbox2))
 
 def analyze_chunk_worker(file_path, page_indices):
+    import fitz  # 子进程内确保加载（主进程是延迟加载）
     results = []
     errors = []
     doc = None
@@ -231,15 +241,31 @@ def analyze_chunk_worker(file_path, page_indices):
                     except Exception as e:
                         errors.append(f"Page {i} image error: {str(e)}")
                         continue
-                blocks = page.get_text("dict")["blocks"]
+                blocks = page.get_text("rawdict")["blocks"]
                 for b in blocks:
                     if b["type"] != 0: continue
                     for line in b["lines"]:
-                        content = "".join([span["text"] for span in line["spans"]]).strip()
+                        spans = line["spans"]
+                        content = "".join(ch.get("c", "")
+                                           for sp in spans for ch in sp.get("chars", [])).strip()
                         if len(content) > 1:
                             bbox = tuple([round(v, 1) for v in line["bbox"]])
-                            size = round(max(span["size"] for span in line["spans"]), 1)
-                            page_data['texts'].append({'text': content, 'bbox': bbox, 'size': size})
+                            size = round(max(sp.get("size", 0) for sp in spans), 1)
+                            origin = None
+                            rot = 0.0
+                            for sp in spans:
+                                chs = sp.get("chars") or []
+                                if chs and chs[0].get("origin"):
+                                    origin = tuple(round(v, 1) for v in chs[0]["origin"])
+                                # 旋转角：用前两个字符原点算基线方向（fitz y 向下）
+                                if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
+                                    o0, o1 = chs[0]["origin"], chs[1]["origin"]
+                                    rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
+                                if origin is not None:
+                                    break
+                            page_data['texts'].append({'text': content, 'bbox': bbox,
+                                                       'size': size, 'origin': origin,
+                                                       'rot': rot})
                 results.append(page_data)
             except Exception as e:
                 errors.append(f"Page {i} general error: {str(e)}")
@@ -549,7 +575,8 @@ class EnhancedWatermarkDialog(QDialog):
                     # 预览失败也要保留可勾选条目，避免候选静默消失
                     print(f"Error loading img preview: {e}")
                     lab = QLabel("⚠ preview failed")
-                lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img"})
+                lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img",
+                                             "pages": info.get('pages', [info['sample_page']])})
                 lab.installEventFilter(self)
                 l.addWidget(lab); l.addStretch()
                 l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
@@ -575,14 +602,16 @@ class EnhancedWatermarkDialog(QDialog):
                     img_lab = QLabel()
                     img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                     # 设置 type 为 txt
-                    img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": bbox, "type": "txt"})
+                    img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": bbox, "type": "txt",
+                                                     "pages": info.get('pages', [info['sample_page']])})
                     img_lab.installEventFilter(self)
                     row_layout.addWidget(img_lab)
                 except Exception as e:
                     print(f"Error loading text preview: {e}")
                 row_layout.addStretch()
                 row_layout.addWidget(QLabel(f"<span style='{TXT_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
-                self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': info.get('bbox', (0, 0, 0, 0)), 'size': key[1]})
+                self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': info.get('bbox', (0, 0, 0, 0)), 'size': key[1],
+                                             'origin': info.get('origin'), 'rot': info.get('rot', 0.0)})
                 self.text_cards.append((frame, key[0].lower()))
                 self.scroll_layout.addWidget(frame)
 
@@ -596,14 +625,54 @@ class EnhancedWatermarkDialog(QDialog):
         self.location_preview = QLabel(self.t["preview_tip"])
         self.location_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.location_preview.setStyleSheet("border: 2px solid #ddd; background: #ffffff; border-radius: 5px;")
-        main_layout.addWidget(left_container); main_layout.addWidget(self.location_preview, 1)
+        self.location_preview.installEventFilter(self)
+        right_col = QVBoxLayout()
+        right_col.addWidget(self.location_preview, 1)
+        self.hover_hint = QLabel("")
+        self.hover_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hover_hint.setStyleSheet("color: #888;")
+        right_col.addWidget(self.hover_hint)
+        main_layout.addWidget(left_container)
+        main_layout.addLayout(right_col, 1)
+        self._hover_pages = []
+        self._hover_pos = 0
+        self._hover_bbox = None
+        self._hover_type = "txt"
 
     def eventFilter(self, source, event):
-        if event.type() == QEvent.Type.Enter:
+        et = event.type()
+        if et == QEvent.Type.Enter:
             loc = source.property("loc_info")
-            if loc: self.show_location_on_page(loc["page"], loc["bbox"], loc["type"])
+            if loc:
+                pages = loc.get("pages") or [loc["page"]]
+                self._hover_pages = list(pages)
+                try:
+                    self._hover_pos = self._hover_pages.index(loc["page"])
+                except ValueError:
+                    self._hover_pos = 0
+                self._hover_bbox = loc["bbox"]
+                self._hover_type = loc["type"]
+                self.show_location_on_page(loc["page"], loc["bbox"], loc["type"])
+                self._update_hover_hint()
+            return True
+        # 悬停候选后，滚轮在"该候选出现的各页"间切换预览
+        if et == QEvent.Type.Wheel and source is self.location_preview and len(self._hover_pages) > 1:
+            delta = event.angleDelta().y()
+            n = len(self._hover_pages)
+            self._hover_pos = (self._hover_pos + (-1 if delta > 0 else 1)) % n
+            pg = self._hover_pages[self._hover_pos]
+            self.show_location_on_page(pg, self._hover_bbox, self._hover_type)
+            self._update_hover_hint()
+            event.accept()
             return True
         return super().eventFilter(source, event)
+
+    def _update_hover_hint(self):
+        if len(self._hover_pages) > 1:
+            self.hover_hint.setText(
+                f"🖱 滚轮切换该候选出现的页面（{self._hover_pos + 1}/{len(self._hover_pages)}）")
+        else:
+            self.hover_hint.setText("")
 
     def show_location_on_page(self, page_idx, bbox, mark_type):
         try:
@@ -640,10 +709,16 @@ class EnhancedWatermarkDialog(QDialog):
         for cb in self.img_boxes.values(): cb.setChecked(False)
         for item in self.text_line_boxes: item['checkbox'].setChecked(False)
     def filter_items(self, text):
-        for frame, content in self.text_cards: frame.setVisible(text.lower() in content)
+        # 忽略所有空白（中文/IME 输入可能带空格或全角空格）
+        q = "".join(text.lower().split())
+        for frame, content in self.text_cards:
+            c = "".join(content.split())
+            frame.setVisible(q in c)
     def get_selection(self):
         imgs = [h for h, cb in self.img_boxes.items() if cb.isChecked()]
-        txts = [{'text': i['content'], 'bbox': i['bbox'], 'size': i['size']} for i in self.text_line_boxes if i['checkbox'].isChecked()]
+        txts = [{'text': i['content'], 'bbox': i['bbox'], 'size': i['size'],
+                 'origin': i.get('origin'), 'rot': i.get('rot', 0.0)}
+                for i in self.text_line_boxes if i['checkbox'].isChecked()]
         return imgs, txts
 
     def get_apply_all(self):
@@ -702,6 +777,8 @@ class MasterWorker(QThread):
 
     def _process_one(self, fpath, fi, nfiles):
         """处理单个文件：分析 → 确认 → 清理 → 复检。返回输出路径或 None。"""
+        if _dw is None or fitz is None or pikepdf is None:
+            _load_heavy_libs()
         self.log_signal.emit(">>> Starting analysis...")
         doc = fitz.open(fpath)
         total = len(doc)
@@ -728,6 +805,8 @@ class MasterWorker(QThread):
             size_groups.setdefault(data['size_key'], []).append(data)
 
         final_img_candidates = {}; final_txt_candidates = {}
+        pages_by_hash = {}
+        pages_by_tk = {}
         for size_key, pages in size_groups.items():
             group_count = len(pages)
             threshold = max(2, group_count * self.ratio_threshold)
@@ -735,6 +814,7 @@ class MasterWorker(QThread):
             for p in pages:
                 unique_hashes = set(img['hash'] for img in p['imgs'])
                 for h in unique_hashes:
+                    pages_by_hash.setdefault(h, []).append(p['index'])
                     img_counts[h] = img_counts.get(h, 0) + 1
                     if h not in final_img_candidates:
                         for img in p['imgs']:
@@ -745,9 +825,13 @@ class MasterWorker(QThread):
                                                            'sample_bbox': tuple(img_rect)}
                 for t in p['texts']:
                     tk = (t['text'], t['size'], size_key)
+                    pages_by_tk.setdefault(tk, []).append(p['index'])
                     txt_counts[tk] = txt_counts.get(tk, 0) + 1
                     if tk not in final_txt_candidates:
-                        final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0, 'bbox': t['bbox']}
+                        final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0,
+                                                    'bbox': t['bbox'],
+                                                    'origin': t.get('origin'),
+                                                    'rot': t.get('rot', 0.0)}
             for h, count in img_counts.items():
                 if count >= threshold:
                     final_img_candidates[h]['count'] += count
@@ -757,6 +841,11 @@ class MasterWorker(QThread):
 
         final_img_candidates = {k: v for k, v in final_img_candidates.items() if v['count'] > 0}
         final_txt_candidates = {k: v for k, v in final_txt_candidates.items() if v['count'] > 0}
+        # 记录每个候选出现的页面列表（弹窗里滚轮切换预览用）
+        for h, info in final_img_candidates.items():
+            info['pages'] = sorted(set(pages_by_hash.get(h, [info['sample_page']])))
+        for tk, info in final_txt_candidates.items():
+            info['pages'] = sorted(set(pages_by_tk.get(tk, [info['sample_page']])))
 
         # 确认环节：批量且已有复用确认项时跳过弹窗
         ic, tc = list(self.confirmed_hashes), list(self.confirmed_texts)
@@ -809,6 +898,18 @@ class MasterWorker(QThread):
             n += _wm_process_xobjects(page.get("/Resources"), keywords)
             removed_total += n
             self.progress.emit(30 + int((i + 1) / total * 30))
+        # 几何签名删除（CID/特殊编码字体水印的关键词兜底）
+        geo_removed = 0
+        geo_targets = []
+        for c in tc:
+            if c.get('origin') and c.get('size'):
+                geo_targets.append((float(c['size']), float(c.get('rot', 0.0)),
+                                    float(c['origin'][0]), float(c['origin'][1])))
+        if geo_targets:
+            for page in pdf.pages:
+                if self.stop_flag:
+                    break
+                geo_removed += _dw.process_page_geo(pdf, page, geo_targets)
         img_removed = 0
         if confirmed_xrefs:
             img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
@@ -837,7 +938,7 @@ class MasterWorker(QThread):
             chk.close()
         except Exception:
             pass
-        self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
+        self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个(关键词)；几何删除: {geo_removed} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
         if resid == 0 and not left_imgs:
             self.log_signal.emit(">>> Verify passed: no residual")
         else:
@@ -859,6 +960,9 @@ class UltraAppFinal(QMainWindow):
         self.zoom = 1.0
         self.fit_mode = "fit_page"   # fit_page / fit_width / custom
         self.batch_files = []
+        self._sb_guard = False       # 滚动条联动防递归
+        self._rb_start = None        # 矩形框放大起点
+        self._rubber = None
 
         self.scale = QApplication.primaryScreen().logicalDotsPerInch() / 96.0
         self.init_ui(); self.setAcceptDrops(True)
@@ -910,8 +1014,15 @@ class UltraAppFinal(QMainWindow):
             s.setWidgetResizable(False)
             s.setAlignment(Qt.AlignmentFlag.AlignCenter)
             s.installEventFilter(self)
+            l.installEventFilter(self)   # 支持左键拖框放大
         comp.addWidget(self.scroll_orig); comp.addWidget(self.scroll_clean)
-        viewer.addLayout(nav); viewer.addLayout(comp)
+        # 页码滚动条：适合页面模式下显示，值=页码（拉到最底=最后一页）
+        preview_row = QHBoxLayout()
+        preview_row.addLayout(comp)
+        self.page_bar = QScrollBar(Qt.Orientation.Vertical)
+        self.page_bar.setRange(0, 0)
+        preview_row.addWidget(self.page_bar)
+        viewer.addLayout(nav); viewer.addLayout(preview_row)
 
         layout.addLayout(sidebar, 1); layout.addLayout(viewer, 4)
         self.btn_open.clicked.connect(self.load_file_dialog)
@@ -924,6 +1035,7 @@ class UltraAppFinal(QMainWindow):
         self.btn_fw.clicked.connect(lambda: self.set_fit("fit_width"))
         self.btn_fp.clicked.connect(lambda: self.set_fit("fit_page"))
         self.page_spin.valueChanged.connect(self.update_previews)
+        self.page_bar.valueChanged.connect(self._on_page_bar)
 
     def refresh_ui_text(self):
         t = TRANSLATIONS[self.lang]
@@ -968,27 +1080,47 @@ class UltraAppFinal(QMainWindow):
         self.log_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def eventFilter(self, source, event):
-        # 滚轮策略：
-        #   Ctrl+滚轮 = 缩放
-        #   页面放不下(有滚动条) → 交给滚动条滚动
-        #   整页放得下(无滚动条) → 滚轮翻页
-        if event.type() == QEvent.Type.Wheel and self.doc_orig:
+        et = event.type()
+        # --- 左键拖框放大 ---
+        if source in (self.lab_orig, self.lab_clean):
+            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._rb_start = event.position().toPoint()
+                if self._rubber is None:
+                    self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, source)
+                self._rubber.setGeometry(QRect(self._rb_start, self._rb_start))
+                self._rubber.show()
+                return True
+            if et == QEvent.Type.MouseMove and self._rb_start is not None:
+                self._rubber.setGeometry(QRect(self._rb_start, event.position().toPoint()).normalized())
+                return True
+            if et == QEvent.Type.MouseButtonRelease and self._rb_start is not None:
+                self._rubber.hide()
+                rect = QRect(self._rb_start, event.position().toPoint()).normalized()
+                self._rb_start = None
+                if rect.width() >= 8 and rect.height() >= 8:
+                    self._zoom_to_rect(source, rect)
+                return True
+        # --- 滚轮策略 ---
+        if et == QEvent.Type.Wheel and self.doc_orig:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
-                self.zoom_by(1.2 if delta > 0 else 1 / 1.2)
+                self.zoom_around(event.globalPosition(), 1.2 if delta > 0 else 1 / 1.2)
                 event.accept()
                 return True
+            if self.fit_mode == "fit_page":
+                # 页码导航模式：滚轮翻页
+                delta = event.angleDelta().y()
+                self.page_spin.setValue(self.page_spin.value() + (-1 if delta > 0 else 1))
+                return True
+            # 放大模式：页面放不下交给滚动条；放得下则翻页
             sb_orig = self.scroll_orig.verticalScrollBar()
             sb_clean = self.scroll_clean.verticalScrollBar()
             has_range = (sb_orig is not None and sb_orig.maximum() > 0) or \
                         (sb_clean is not None and sb_clean.maximum() > 0)
             if has_range:
-                return False  # 有可滚动内容 → 交给滚动条
+                return False
             delta = event.angleDelta().y()
-            if delta > 0:
-                self.page_spin.setValue(self.page_spin.value() - 1)
-            else:
-                self.page_spin.setValue(self.page_spin.value() + 1)
+            self.page_spin.setValue(self.page_spin.value() + (-1 if delta > 0 else 1))
             return True
         return super().eventFilter(source, event)
 
@@ -1004,18 +1136,119 @@ class UltraAppFinal(QMainWindow):
 
     def zoom_by(self, factor):
         self.fit_mode = "custom"
-        self.zoom = max(0.2, min(6.0, self.zoom * factor))
+        self.zoom = max(0.2, min(12.0, self.zoom * factor))
         self.zoom_label.setText(f"{int(self.zoom * 100)}%")
         self.update_previews()
+        # 缩放后两侧预览显示同一区域
+        self._sync_scroll_views(self.scroll_orig)
+
+    def zoom_around(self, gp, factor):
+        """以鼠标位置为中心缩放（鼠标下的 PDF 内容保持不动）。"""
+        scroll = None
+        for sc in (self.scroll_orig, self.scroll_clean):
+            vp = sc.viewport()
+            if vp.rect().contains(vp.mapFromGlobal(gp.toPoint())):
+                scroll = sc
+                break
+        if scroll is None:
+            scroll = self.scroll_orig
+        lab = self.lab_orig if scroll is self.scroll_orig else self.lab_clean
+        self._zoom_around_local(scroll, lab.mapFromGlobal(gp.toPoint()), factor)
+
+    def _zoom_around_local(self, scroll, local, factor):
+        """锚点缩放核心：保持鼠标下的 PDF 点屏幕位置不变。"""
+        lab = self.lab_orig if scroll is self.scroll_orig else self.lab_clean
+        doc = self.doc_orig if scroll is self.scroll_orig else self.doc_clean
+        if doc is None or lab.width() <= 0:
+            return
+        hsb, vsb = scroll.horizontalScrollBar(), scroll.verticalScrollBar()
+        old_z = self.zoom
+        new_z = max(0.2, min(12.0, old_z * factor))
+        if abs(new_z - old_z) < 1e-9:
+            return
+        # 鼠标下的 PDF 坐标（当前视图）
+        px = (local.x() + hsb.value()) / old_z
+        py = (local.y() + vsb.value()) / old_z
+        self.zoom = new_z
+        self.fit_mode = "custom"
+        self.zoom_label.setText(f"{int(new_z * 100)}%")
+        self.update_previews()
+        # 缩放后让该 PDF 点仍位于鼠标下
+        hsb.setValue(int(px * new_z - local.x()))
+        vsb.setValue(int(py * new_z - local.y()))
+        self._sync_scroll_views(scroll)
 
     def set_fit(self, mode):
         self.fit_mode = mode
         self.update_previews()
 
+    def _on_page_bar(self, value):
+        """页码滚动条联动：值=页码-1。"""
+        if self._sb_guard or not self.doc_orig:
+            return
+        target = value + 1
+        if 1 <= target <= self.page_spin.maximum() and target != self.page_spin.value():
+            self.page_spin.setValue(target)
+
+    def _sync_scroll_views(self, src):
+        """让左右两个预览显示同一区域（同步滚动位置）。"""
+        other = self.scroll_clean if src is self.scroll_orig else self.scroll_orig
+        if other is None:
+            return
+        self._sb_guard = True
+        other.horizontalScrollBar().setValue(src.horizontalScrollBar().value())
+        other.verticalScrollBar().setValue(src.verticalScrollBar().value())
+        self._sb_guard = False
+
+    def _zoom_to_rect(self, source, rect):
+        """把预览里框选区域放大到视口并居中（两侧同步）。"""
+        doc = self.doc_orig if source is self.lab_orig else self.doc_clean
+        if doc is None:
+            return
+        scroll = self.scroll_orig if source is self.lab_orig else self.scroll_clean
+        idx = self.page_spin.value() - 1
+        page = doc[idx]
+        lw, lh = source.width(), source.height()
+        if lw <= 0 or lh <= 0:
+            return
+        # 像素矩形 -> PDF 坐标
+        rx0 = page.rect.width * rect.x() / lw
+        ry0 = page.rect.height * rect.y() / lh
+        rx1 = page.rect.width * rect.right() / lw
+        ry1 = page.rect.height * rect.bottom() / lh
+        vw = scroll.viewport().width() - 10
+        vh = scroll.viewport().height() - 10
+        z = min(vw / max(1.0, rx1 - rx0), vh / max(1.0, ry1 - ry0))
+        self.zoom = max(0.2, min(12.0, z))
+        self.fit_mode = "custom"
+        self.zoom_label.setText(f"{int(self.zoom * 100)}%")
+        self.update_previews()
+        # 居中到选区中心，并同步另一侧预览
+        cx = (rx0 + rx1) / 2
+        cy = (ry0 + ry1) / 2
+        hsb = scroll.horizontalScrollBar()
+        vsb = scroll.verticalScrollBar()
+        hsb.setValue(int(cx * self.zoom - vw / 2))
+        vsb.setValue(int(cy * self.zoom - vh / 2))
+        self._sync_scroll_views(scroll)
+
     def update_previews(self):
         if not self.doc_orig:
             return
         idx = self.page_spin.value() - 1
+
+        # 页码滚动条：适合页面模式显示(值=页码)，放大模式隐藏(用滚动区自带滚动条)
+        page_mode = self.fit_mode == "fit_page"
+        self.page_bar.setVisible(page_mode)
+        if page_mode:
+            self._sb_guard = True
+            self.page_bar.setRange(0, self.doc_orig.page_count - 1)
+            self.page_bar.setValue(idx)
+            self._sb_guard = False
+        for s in (self.scroll_orig, self.scroll_clean):
+            s.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff if page_mode
+                else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         def compute_zoom(doc, scroll):
             if self.fit_mode == "fit_page":
@@ -1051,6 +1284,8 @@ class UltraAppFinal(QMainWindow):
 
     def load_pdf(self, path):
         """加载 PDF 文件（文件对话框、拖拽、最近文件共用的入口）。"""
+        if fitz is None:
+            _load_heavy_libs()
         if not path or not os.path.isfile(path):
             self.add_log(f"File not found: {path}")
             return False
@@ -1161,5 +1396,9 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     app = QApplication(sys.argv)
-    apply_dark_mode(app, None)  # 跟随系统深色/浅色
-    window = UltraAppFinal(); sys.exit(app.exec())
+    apply_dark_mode(app, None)
+    window = UltraAppFinal()
+    # 重型库后台延迟加载，窗口先出现
+    import threading
+    threading.Thread(target=_load_heavy_libs, daemon=True).start()
+    sys.exit(app.exec())
