@@ -968,13 +968,28 @@ class UltraAppFinal(QMainWindow):
         self.log_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def eventFilter(self, source, event):
-        # Ctrl+滚轮 = 缩放；普通滚轮交给滚动条（放大时滚动页面）
+        # 滚轮策略：
+        #   Ctrl+滚轮 = 缩放
+        #   页面放不下(有滚动条) → 交给滚动条滚动
+        #   整页放得下(无滚动条) → 滚轮翻页
         if event.type() == QEvent.Type.Wheel and self.doc_orig:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
                 self.zoom_by(1.2 if delta > 0 else 1 / 1.2)
                 event.accept()
                 return True
+            sb_orig = self.scroll_orig.verticalScrollBar()
+            sb_clean = self.scroll_clean.verticalScrollBar()
+            has_range = (sb_orig is not None and sb_orig.maximum() > 0) or \
+                        (sb_clean is not None and sb_clean.maximum() > 0)
+            if has_range:
+                return False  # 有可滚动内容 → 交给滚动条
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.page_spin.setValue(self.page_spin.value() - 1)
+            else:
+                self.page_spin.setValue(self.page_spin.value() + 1)
+            return True
         return super().eventFilter(source, event)
 
     def keyPressEvent(self, event):
