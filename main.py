@@ -428,22 +428,30 @@ class EnhancedWatermarkDialog(QDialog):
                 frame = QFrame(); frame.setFrameStyle(QFrame.Shape.StyledPanel)
                 l = QHBoxLayout(frame); l.setContentsMargins(5, 5, 5, 5)
                 cb = QCheckBox(""); cb.setChecked(False); self.img_boxes[h] = cb
+                l.addWidget(cb)
                 try:
                     pix = fitz.Pixmap(self.doc, info['xref'])
-                    # 如果原图很大，先缩放再转 QImage
+                    # 如果原图很大，先缩放再转 QImage。
+                    # 注意：新版 pymupdf 的 Pixmap(pix, matrix) 构造器有兼容问题，
+                    # 用 scale() 原地缩放；失败则直接用原图（预览由 QPixmap.scaled 兜底）
                     if pix.width > 400 or pix.height > 400:
-                        zoom = min(400/pix.width, 400/pix.height)
-                        pix = fitz.Pixmap(pix, fitz.Matrix(zoom, zoom))
+                        try:
+                            zoom = min(400 / pix.width, 400 / pix.height)
+                            pix.scale(zoom, zoom)
+                        except Exception:
+                            pass
                     qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                     lab = QLabel()
                     lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                    lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img"})
-                    lab.installEventFilter(self)
-                    l.addWidget(cb); l.addWidget(lab); l.addStretch()
-                    l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
-                    self.scroll_layout.addWidget(frame)
                 except Exception as e:
+                    # 预览失败也要保留可勾选条目，避免候选静默消失
                     print(f"Error loading img preview: {e}")
+                    lab = QLabel("⚠ preview failed")
+                lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img"})
+                lab.installEventFilter(self)
+                l.addWidget(lab); l.addStretch()
+                l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
+                self.scroll_layout.addWidget(frame)
 
         if text_blocks:
             header_txt = QLabel(f"<b>{self.t['txt_header']}</b>")
