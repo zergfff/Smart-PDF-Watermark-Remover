@@ -443,7 +443,9 @@ def detect_image_watermarks(path, pdf, min_ratio=0.5, min_area_ratio=0.08):
 
 
 def _names_to_remove(res, cand, seen_forms):
-    """返回资源树中需移除的 XObject 名字：objgen 命中候选的图片/包装 Form。"""
+    """返回资源树中需移除的 XObject 名字。
+    规则：图片 objgen 命中候选；或 Form 容器（无论自身 objgen 是否候选）
+    只要其内部图片非空且全部命中候选 → 整容器删除（兼容容器包装的水印）。"""
     names = set()
     if res is None:
         return names
@@ -460,11 +462,16 @@ def _names_to_remove(res, cand, seen_forms):
         if sub == pikepdf.Name('/Image') and obj.objgen in cand:
             names.add(name)
         elif sub == pikepdf.Name('/Form'):
-            if obj.objgen in cand:
-                names.add(name)
             g = obj.objgen
             if g not in seen_forms:
                 seen_forms.add(g)
+                try:
+                    inner, _ = _leaf_image_refs(obj.read_bytes(),
+                                                obj.get('/Resources'), {g})
+                except Exception:
+                    inner = set()
+                if obj.objgen in cand or (inner and inner <= cand):
+                    names.add(name)
                 names |= _names_to_remove(obj.get('/Resources'), cand, seen_forms)
     return names
 

@@ -2,6 +2,7 @@ import sys
 import os
 import tempfile
 import xxhash
+import uuid
 import fitz
 import pikepdf
 import pdf_dewatermark as _dw
@@ -614,7 +615,8 @@ class MasterWorker(QThread):
             self.log_signal.emit(">>> Applying cleaning process...")
             # ---- 1) 图片水印：先收集用户确认的图片 xref（哈希反查），
             #        实际删除放到 pikepdf 阶段用内容流 Do 级删除（兼容 Form 容器内图片） ----
-            tmp_imgs = os.path.join(tempfile.gettempdir(), f"__wm_imgs_{os.path.basename(self.file_path)}")
+            tmp_imgs = os.path.join(tempfile.gettempdir(),
+                                    f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
             confirmed_xrefs = set()
             for i in range(total):
                 page = doc[i]
@@ -639,7 +641,8 @@ class MasterWorker(QThread):
                 n += _wm_process_xobjects(page.get("/Resources"), keywords)
                 removed_total += n
                 self.progress.emit(50 + int((i + 1) / total * 50))
-            out_tmp = os.path.join(tempfile.gettempdir(), f"__wm_final_{os.path.basename(self.file_path)}")
+            out_tmp = os.path.join(tempfile.gettempdir(),
+                                   f"__wm_final_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
             img_removed = 0
             if confirmed_xrefs:
                 img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
