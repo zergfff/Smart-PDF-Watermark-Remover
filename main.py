@@ -545,9 +545,10 @@ class EnhancedWatermarkDialog(QDialog):
 # --- 3. 后台清理工作线程 ---
 class MasterWorker(QThread):
     progress = pyqtSignal(int)
-    log_signal = pyqtSignal(str) 
+    log_signal = pyqtSignal(str)
     need_confirm = pyqtSignal(dict, dict)
     finished = pyqtSignal(object)
+    failed = pyqtSignal()
 
     def __init__(self, file_path, ratio_threshold=30):
         super().__init__()
@@ -656,7 +657,9 @@ class MasterWorker(QThread):
             self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
             self.log_signal.emit(">>> Done! Cleaned PDF is ready for preview/save.")
             self.finished.emit(fitz.open(out_tmp))
-        except Exception as e: self.log_signal.emit(f"Error: {e}")
+        except Exception as e:
+            self.log_signal.emit(f"Error: {e}")
+            self.failed.emit()
 
 # --- 4. 主程序窗口 ---
 class UltraAppFinal(QMainWindow):
@@ -666,6 +669,7 @@ class UltraAppFinal(QMainWindow):
         self.display_lists = {}; self.file_path = ""
         self.ratio_threshold = 30
         self.lang = "en"
+        self.worker = None
         
         self.scale = QApplication.primaryScreen().logicalDotsPerInch() / 96.0
         self.init_ui(); self.setAcceptDrops(True)
@@ -800,12 +804,17 @@ class UltraAppFinal(QMainWindow):
 
     def start_task(self):
         if not self.doc_orig: return
+        if self.worker is not None and self.worker.isRunning():
+            self.add_log(">>> 分析正在进行中，请等待完成…")
+            return
         self.pbar.setValue(0)
+        self.btn_clean.setEnabled(False)
         self.worker = MasterWorker(self.file_path, self.ratio_threshold)
         self.worker.progress.connect(self.pbar.setValue)
         self.worker.log_signal.connect(self.add_log)
         self.worker.need_confirm.connect(self.ask_user)
         self.worker.finished.connect(self.task_done)
+        self.worker.failed.connect(lambda: self.btn_clean.setEnabled(True))
         self.worker.start()
 
     def ask_user(self, ic, tc):
@@ -819,7 +828,9 @@ class UltraAppFinal(QMainWindow):
         self.worker.is_confirmed = True
 
     def task_done(self, doc):
-        self.doc_clean = doc; self.btn_save.setEnabled(True); self.update_previews()
+        self.doc_clean = doc; self.btn_save.setEnabled(True)
+        self.btn_clean.setEnabled(True)
+        self.update_previews()
 
     def save_as_pdf(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save", f"cleaned_{os.path.basename(self.file_path)}", "PDF (*.pdf)")
