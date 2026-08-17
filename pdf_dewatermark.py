@@ -568,16 +568,16 @@ def main():
     ap.add_argument("-o", "--output", default=None, help="输出 PDF（默认 <原名>_cleaned.pdf）")
     ap.add_argument("-k", "--keyword", action="append", default=[],
                     help="水印关键词，可多次指定（子串匹配）")
-    ap.add_argument("--images", action="store_true",
-                    help="图片水印模式：自动检测被多数页引用的同一图片并移除")
+    ap.add_argument("--no-images", action="store_true",
+                    help="关闭自动图片水印检测（默认开启：自动检测多数页绘制的大面积重复图片，页眉/Logo 小图不误删）")
     ap.add_argument("--image-xref", action="append", type=int, default=[],
                     help="手动指定要移除的水印图片 xref（可多次）")
     ap.add_argument("--password", default="", help="打开加密 PDF 的密码（默认空）")
     ap.add_argument("--no-verify", action="store_true", help="关闭输出后的残留检查")
     args = ap.parse_args()
 
-    if not args.keyword and not args.images and not args.image_xref:
-        print("错误：需要 -k 关键词，或 --images / --image-xref 图片水印模式", file=sys.stderr)
+    if not args.keyword and not args.image_xref and args.no_images:
+        print("错误：需要 -k 关键词，或 --image-xref 图片水印（--no-images 已关闭自动检测）", file=sys.stderr)
         sys.exit(2)
 
     out_path = args.output or re.sub(r"\.pdf$", "", args.input, flags=re.I) + "_cleaned.pdf"
@@ -608,7 +608,7 @@ def main():
     if args.image_xref:
         img_cands |= find_image_objgens(pdf, set(args.image_xref))
         print(f"手动指定图片 xref: {sorted(set(args.image_xref))}")
-    if args.images:
+    if not args.no_images:
         auto, cnt = detect_image_watermarks(args.input, pdf, 0.5, 0.08)
         img_cands |= auto
         if auto:

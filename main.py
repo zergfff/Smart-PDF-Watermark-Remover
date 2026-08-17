@@ -4,6 +4,7 @@ import tempfile
 import xxhash
 import fitz
 import pikepdf
+import pdf_dewatermark as _dw
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -603,15 +604,17 @@ class MasterWorker(QThread):
             while not self.is_confirmed: self.msleep(50)
             
             self.log_signal.emit(">>> Applying cleaning process...")
-            # ---- 1) 图片水印：fitz delete_image（按 xref 哈希，仅删图片对象本身） ----
+            # ---- 1) 图片水印：先收集用户确认的图片 xref（哈希反查），
+            #        实际删除放到 pikepdf 阶段用内容流 Do 级删除（兼容 Form 容器内图片） ----
             tmp_imgs = os.path.join(tempfile.gettempdir(), f"__wm_imgs_{os.path.basename(self.file_path)}")
+            confirmed_xrefs = set()
             for i in range(total):
                 page = doc[i]
                 for img in page.get_images():
                     try:
                         pix = fitz.Pixmap(doc, img[0])
                         if xxhash.xxh64(pix.samples).hexdigest() in self.confirmed_hashes:
-                            page.delete_image(img[0])
+                            confirmed_xrefs.add(img[0])
                     except Exception:
                         continue
                 self.progress.emit(int((i + 1) / total * 50))
@@ -629,9 +632,13 @@ class MasterWorker(QThread):
                 removed_total += n
                 self.progress.emit(50 + int((i + 1) / total * 50))
             out_tmp = os.path.join(tempfile.gettempdir(), f"__wm_final_{os.path.basename(self.file_path)}")
+            img_removed = 0
+            if confirmed_xrefs:
+                img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
+                img_removed = _dw.remove_image_watermarks(pdf, img_cand)
             pdf.save(out_tmp, encryption=False)
             pdf.close()
-            self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；权限限制已移除")
+            self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
             self.log_signal.emit(">>> Done! Cleaned PDF is ready for preview/save.")
             self.finished.emit(fitz.open(out_tmp))
         except Exception as e: self.log_signal.emit(f"Error: {e}")
