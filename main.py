@@ -1,7 +1,9 @@
 import sys
 import os
+import tempfile
 import xxhash
 import fitz
+import pikepdf
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -133,7 +135,8 @@ def analyze_chunk_worker(file_path, page_indices):
                         content = "".join([span["text"] for span in line["spans"]]).strip()
                         if len(content) > 1:
                             bbox = tuple([round(v, 1) for v in line["bbox"]])
-                            page_data['texts'].append({'text': content, 'bbox': bbox})
+                            size = round(max(span["size"] for span in line["spans"]), 1)
+                            page_data['texts'].append({'text': content, 'bbox': bbox, 'size': size})
                 results.append(page_data)
             except Exception as e:
                 errors.append(f"Page {i} general error: {str(e)}")
@@ -142,6 +145,188 @@ def analyze_chunk_worker(file_path, page_indices):
     finally:
         if doc: doc.close()
     return results, errors
+
+# --- 1.5 内容流级删除（替代红色遮盖 redaction，避免误删正文） ---
+import re as _re
+
+def _parse_strings_in_block(block: bytes) -> list:
+    """从 BT..ET 块中提取所有 Tj/TJ 字符串（明文 (...) 与 hex <...>）。"""
+    out = []
+    i = 0
+    n = len(block)
+    while i < n:
+        c = block[i]
+        if c == ord("("):
+            j = i + 1
+            depth = 1
+            buf = bytearray()
+            while j < n and depth > 0:
+                ch = block[j]
+                if ch == ord("\\"):
+                    if j + 1 >= n:
+                        break
+                    nxt = block[j + 1]
+                    mapping = {ord("n"): 10, ord("r"): 13, ord("t"): 9,
+                               ord("b"): 8, ord("f"): 12, ord("("): 40,
+                               ord(")"): 41, ord("\\"): 92}
+                    if nxt in mapping:
+                        buf.append(mapping[nxt])
+                    elif nxt == ord("0") and j + 3 < n and all(
+                            ord("0") <= block[j + k] <= ord("7") for k in (1, 2, 3)):
+                        buf.append(int(block[j + 1:j + 4], 8))
+                        j += 3
+                    else:
+                        buf.append(nxt)
+                    j += 2
+                    continue
+                if ch == ord("("):
+                    depth += 1
+                elif ch == ord(")"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+                buf.append(ch)
+                j += 1
+            out.append(bytes(buf))
+            i = j + 1
+        elif c == ord("<"):
+            j = i + 1
+            while j < n and block[j] != ord(">"):
+                j += 1
+            hexpart = _re.sub(rb"\s", b"", block[i + 1:j])
+            if len(hexpart) % 2:
+                hexpart += b"0"
+            try:
+                out.append(bytes.fromhex(hexpart.decode("ascii")))
+            except ValueError:
+                out.append(b"")
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _split_bt_et_blocks(stream: bytes):
+    """把内容流切成 [前缀, BT块, BT块, ..., 尾随]。返回 (块列表, 尾随内容)。"""
+    blocks = []
+    rest = []
+    i = 0
+    n = len(stream)
+    while i < n:
+        bt = stream.find(b"BT", i)
+        if bt < 0:
+            rest.append(stream[i:])
+            break
+        if bt > 0 and stream[bt - 1:bt] in b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/":
+            i = bt + 2
+            continue
+        rest.append(stream[i:bt])
+        et = stream.find(b"ET", bt + 2)
+        if et < 0:
+            blocks.append(stream[bt:])
+            break
+        blocks.append(stream[bt:et + 2])
+        i = et + 2
+    return blocks, b"".join(rest)
+
+
+def _block_matches(block: bytes, keywords: list) -> bool:
+    """块内任一字符串命中任一关键词（子串匹配，忽略大小写）。"""
+    if not keywords:
+        return False
+    for s in _parse_strings_in_block(block):
+        ls = s.lower()
+        for kw in keywords:
+            if kw.lower() in ls:
+                return True
+    return False
+
+
+def _strip_watermark_stream(data: bytes, keywords: list):
+    """从单个内容流中删除命中关键词的 BT..ET 块。
+    返回 (新流或 None 表示流已空, 删除块数)。"""
+    blocks, tail = _split_bt_et_blocks(data)
+    kept = []
+    removed = 0
+    for b in blocks:
+        if _block_matches(b, keywords):
+            removed += 1
+        else:
+            kept.append(b)
+    if removed == 0:
+        return data, 0
+    new_data = b"".join(kept) + tail
+    # 若删除后只剩 q/Q 之类的空壳，整个流移除
+    stripped = new_data.replace(b"q", b"").replace(b"Q", b"").strip()
+    if not stripped:
+        return None, removed
+    return new_data, removed
+
+
+def _wm_process_page(pdf, page, keywords: list) -> int:
+    """处理一页的 Contents（数组或单流），返回删除的块数。"""
+    total = 0
+    contents = page.Contents
+    if contents is None:
+        return 0
+    if isinstance(contents, pikepdf.Array):
+        new_arr = pikepdf.Array()
+        for s in contents:
+            if s is None:
+                new_arr.append(s)
+                continue
+            data = s.read_bytes()
+            new_data, removed = _strip_watermark_stream(data, keywords)
+            total += removed
+            if removed == 0:
+                new_arr.append(s)  # 未改动，原样保留
+                continue
+            if new_data is None:
+                continue  # 整个流被删
+            # 只对改动过的流重写；不传 filter，pikepdf 保留原压缩方式
+            s.write(new_data)
+            new_arr.append(s)
+        if len(new_arr) == 0:
+            # 页面没有内容了：给一个空流避免损坏
+            page.Contents = pikepdf.Stream(pdf, b"")
+        else:
+            page.Contents = new_arr
+    else:
+        data = contents.read_bytes()
+        new_data, removed = _strip_watermark_stream(data, keywords)
+        total += removed
+        if removed == 0:
+            return total
+        if new_data is None:
+            page.Contents = pikepdf.Stream(pdf, b"")
+        else:
+            contents.write(new_data)
+    return total
+
+
+def _wm_process_xobjects(resources, keywords: list) -> int:
+    """递归处理 Resources/XObject 中的 Form 流。"""
+    total = 0
+    if resources is None or "/XObject" not in resources:
+        return 0
+    xo = resources["/XObject"]
+    for name in list(xo.keys()):
+        obj = xo[name]
+        if obj is None:
+            continue
+        if "/Subtype" in obj and str(obj["/Subtype"]) == "/Form":
+            data = obj.read_bytes()
+            new_data, removed = _strip_watermark_stream(data, keywords)
+            total += removed
+            if removed:
+                if new_data is None:
+                    del xo[name]
+                else:
+                    obj.write(new_data)
+            if "/Resources" in obj:
+                total += _wm_process_xobjects(obj["/Resources"], keywords)
+    return total
+
 
 # --- 2. 交互确认对话框 ---
 class EnhancedWatermarkDialog(QDialog):
@@ -213,21 +398,22 @@ class EnhancedWatermarkDialog(QDialog):
                 row_layout.addWidget(cb)
                 try:
                     sample_page = self.doc[info['sample_page']]
-                    clip_rect = fitz.Rect(key[1]) + (-10, -5, 10, 5)
+                    bbox = info.get('bbox', (0, 0, 0, 0))
+                    clip_rect = fitz.Rect(bbox) + (-10, -5, 10, 5)
                     # 降低预览图精度以加快速度
                     pix = sample_page.get_pixmap(clip=clip_rect, matrix=fitz.Matrix(1.5, 1.5))
                     qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                     img_lab = QLabel()
                     img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                     # 设置 type 为 txt
-                    img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": key[1], "type": "txt"})
+                    img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": bbox, "type": "txt"})
                     img_lab.installEventFilter(self)
                     row_layout.addWidget(img_lab)
                 except Exception as e:
                     print(f"Error loading text preview: {e}")
                 row_layout.addStretch()
                 row_layout.addWidget(QLabel(f"<span style='{TXT_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
-                self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': key[1], 'size': key[2]})
+                self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': info.get('bbox', (0, 0, 0, 0)), 'size': key[1]})
                 self.text_cards.append((frame, key[0].lower()))
                 self.scroll_layout.addWidget(frame)
 
@@ -340,10 +526,11 @@ class MasterWorker(QThread):
                                     img_rect = doc[p['index']].get_image_rects(img['xref'])[0]
                                     final_img_candidates[h] = {'xref': img['xref'], 'count': 0, 'sample_page': p['index'], 'sample_bbox': tuple(img_rect)}
                     for t in p['texts']:
-                        tk = (t['text'], t['bbox'], size_key)
+                        # 聚类 key：文本内容+字号（不再要求 bbox 完全一致，避免旋转/舍入差异导致匹配失败）
+                        tk = (t['text'], t['size'], size_key)
                         txt_counts[tk] = txt_counts.get(tk, 0) + 1
                         if tk not in final_txt_candidates:
-                            final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0}
+                            final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0, 'bbox': t['bbox']}
 
                 for h, count in img_counts.items():
                     if count >= threshold: final_img_candidates[h]['count'] += count
@@ -358,26 +545,37 @@ class MasterWorker(QThread):
             while not self.is_confirmed: self.msleep(50)
             
             self.log_signal.emit(">>> Applying cleaning process...")
+            # ---- 1) 图片水印：fitz delete_image（按 xref 哈希，仅删图片对象本身） ----
+            tmp_imgs = os.path.join(tempfile.gettempdir(), f"__wm_imgs_{os.path.basename(self.file_path)}")
             for i in range(total):
-                page = doc[i]; pw, ph = round(page.rect.width, 1), round(page.rect.height, 1); cur_size = (pw, ph)
+                page = doc[i]
                 for img in page.get_images():
-                    pix = fitz.Pixmap(doc, img[0])
-                    if xxhash.xxh64(pix.samples).hexdigest() in self.confirmed_hashes: page.delete_image(img[0])
-                p_dict = page.get_text("dict")
-                for b in p_dict["blocks"]:
-                    if b["type"] != 0: continue
-                    for line in b["lines"]:
-                        txt = "".join([s["text"] for s in line["spans"]]).strip()
-                        bbox = tuple([round(v, 1) for v in line["bbox"]])
-                        for conf in self.confirmed_texts:
-                            # 使用模糊匹配替代精确匹配
-                            if txt == conf['text'] and cur_size == conf['size'] and is_bbox_similar(bbox, conf['bbox']):
-                                page.add_redact_annot(line["bbox"])
-                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-                self.progress.emit(int((i + 1) / total * 100))
-            
+                    try:
+                        pix = fitz.Pixmap(doc, img[0])
+                        if xxhash.xxh64(pix.samples).hexdigest() in self.confirmed_hashes:
+                            page.delete_image(img[0])
+                    except Exception:
+                        continue
+                self.progress.emit(int((i + 1) / total * 50))
+            doc.save(tmp_imgs, garbage=4, deflate=True)
+            doc.close()
+
+            # ---- 2) 文本水印：pikepdf 内容流级删除（只删绘制水印的 BT..ET 块，不碰正文）
+            #        同时 encryption=False 彻底移除加密字典与权限位（禁打印/复制/修改等） ----
+            keywords = [c['text'].encode('utf-8') for c in self.confirmed_texts]
+            removed_total = 0
+            pdf = pikepdf.open(tmp_imgs)
+            for i, page in enumerate(pdf.pages):
+                n = _wm_process_page(pdf, page, keywords)
+                n += _wm_process_xobjects(page.get("/Resources"), keywords)
+                removed_total += n
+                self.progress.emit(50 + int((i + 1) / total * 50))
+            out_tmp = os.path.join(tempfile.gettempdir(), f"__wm_final_{os.path.basename(self.file_path)}")
+            pdf.save(out_tmp, encryption=False)
+            pdf.close()
+            self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；权限限制已移除")
             self.log_signal.emit(">>> Done! Cleaned PDF is ready for preview/save.")
-            self.finished.emit(doc)
+            self.finished.emit(fitz.open(out_tmp))
         except Exception as e: self.log_signal.emit(f"Error: {e}")
 
 # --- 4. 主程序窗口 ---
