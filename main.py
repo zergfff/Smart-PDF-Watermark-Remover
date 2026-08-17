@@ -206,28 +206,72 @@ def _parse_strings_in_block(block: bytes) -> list:
     return out
 
 
-def _split_bt_et_blocks(stream: bytes):
-    """把内容流切成 [前缀, BT块, BT块, ..., 尾随]。返回 (块列表, 尾随内容)。"""
-    blocks = []
-    rest = []
-    i = 0
-    n = len(stream)
+def _find_ops(stream: bytes):
+    """扫描内容流，返回字符串之外的 (BT/ET, 位置) 操作符。
+    跳过 (...) 字符串（含转义/嵌套）、<...> 十六进制串与 <<...>> 字典的字节，
+    避免把正文文本里出现的大写 BT/ET 误判为操作符。"""
+    ops = []
+    i, n = 0, len(stream)
     while i < n:
-        bt = stream.find(b"BT", i)
-        if bt < 0:
-            rest.append(stream[i:])
-            break
-        if bt > 0 and stream[bt - 1:bt] in b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/":
-            i = bt + 2
+        c = stream[i]
+        if c == 0x28:  # '(' 字符串
+            depth = 1
+            i += 1
+            while i < n and depth:
+                ch = stream[i]
+                if ch == 0x5C:  # 反斜杠转义
+                    i += 2
+                    continue
+                if ch == 0x28:
+                    depth += 1
+                elif ch == 0x29:
+                    depth -= 1
+                i += 1
             continue
-        rest.append(stream[i:bt])
-        et = stream.find(b"ET", bt + 2)
-        if et < 0:
-            blocks.append(stream[bt:])
-            break
-        blocks.append(stream[bt:et + 2])
-        i = et + 2
-    return blocks, b"".join(rest)
+        if c == 0x3C:  # '<' 十六进制串或字典
+            if i + 1 < n and stream[i + 1] == 0x3C:
+                j = stream.find(b">>", i + 2)
+                i = n if j < 0 else j + 2
+            else:
+                j = stream.find(b">", i + 1)
+                i = n if j < 0 else j + 1
+            continue
+        if c in (0x42, 0x45) and stream[i:i + 2] in (b"BT", b"ET"):
+            ops.append((stream[i:i + 2], i))
+            i += 2
+            continue
+        i += 1
+    return ops
+
+
+def _split_bt_et_blocks(stream: bytes):
+    """按字符串感知的 BT/ET 把内容流切成块。返回 (块列表, 非块内容拼接)。"""
+    ops = _find_ops(stream)
+    blocks, rest_parts = [], []
+    i = 0
+    k, n_ops = 0, len(ops)
+    while k < n_ops:
+        op, p = ops[k]
+        if op == b"BT":
+            e_pos, j = None, k + 1
+            while j < n_ops:
+                if ops[j][0] == b"ET":
+                    e_pos = ops[j][1]
+                    break
+                j += 1
+            if e_pos is None:  # 未闭合 BT：把剩余内容整个当作块
+                rest_parts.append(stream[i:p])
+                blocks.append(stream[p:])
+                i = len(stream)
+                break
+            rest_parts.append(stream[i:p])
+            blocks.append(stream[p:e_pos + 2])
+            i = e_pos + 2
+            k = j + 1
+        else:
+            k += 1
+    rest_parts.append(stream[i:])
+    return blocks, b"".join(rest_parts)
 
 
 def _block_matches(block: bytes, keywords: list) -> bool:
