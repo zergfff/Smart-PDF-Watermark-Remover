@@ -35,7 +35,6 @@ jobs:
         run: |
           python -m PyInstaller -w --clean --distpath dist_dir --workpath build_on --name Extreme_PDF_Cleaner main.py
           python -c "import shutil; shutil.make_archive('Extreme_PDF_Cleaner_Portable', 'zip', 'dist_dir', 'Extreme_PDF_Cleaner')"
-          echo "portable zip:" && ls -la Extreme_PDF_Cleaner_Portable.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
