@@ -117,7 +117,7 @@ def analyze_chunk_worker(file_path, page_indices):
                 rect = page.rect
                 pw, ph = round(rect.width, 1), round(rect.height, 1)
                 page_data = {'index': i, 'size_key': (pw, ph), 'imgs': [], 'texts': []}
-                for img in page.get_images():
+                for img in page.get_images(full=True):
                     try:
                         pix = fitz.Pixmap(doc, img[0])
                         # 如果图片太大，采样计算哈希以节省内存和时间
@@ -610,7 +610,7 @@ class MasterWorker(QThread):
             confirmed_xrefs = set()
             for i in range(total):
                 page = doc[i]
-                for img in page.get_images():
+                for img in page.get_images(full=True):
                     try:
                         pix = fitz.Pixmap(doc, img[0])
                         if xxhash.xxh64(pix.samples).hexdigest() in self.confirmed_hashes:
