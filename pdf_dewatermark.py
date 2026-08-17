@@ -266,6 +266,268 @@ def process_xobjects(resources, keywords: list) -> int:
     return total
 
 
+def _parse_do_names(data: bytes) -> list:
+    """字符串感知地扫描内容流中的 /Name Do 操作符，返回名字列表（str）。"""
+    names = []
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        if c == 0x28:  # ( 字符串
+            depth = 1; i += 1
+            while i < n and depth:
+                ch = data[i]
+                if ch == 0x5C:
+                    i += 2; continue
+                if ch == 0x28: depth += 1
+                elif ch == 0x29: depth -= 1
+                i += 1
+            continue
+        if c == 0x3C:  # < 十六进制/字典
+            if i + 1 < n and data[i + 1] == 0x3C:
+                j = data.find(b'>>', i + 2); i = n if j < 0 else j + 2
+            else:
+                j = data.find(b'>', i + 1); i = n if j < 0 else j + 1
+            continue
+        if c == 0x2F:  # / 名字
+            j = i + 1
+            while j < n and data[j] not in b" \t\r\n()<>[]{}/%":
+                j += 1
+            nm = data[i + 1:j]
+            k = j
+            while k < n and data[k] in b" \t\r\n":
+                k += 1
+            if data[k:k + 2] == b"Do" and (k + 2 >= n or data[k + 2] in b" \t\r\n"):
+                try:
+                    names.append(nm.decode("latin-1"))
+                except Exception:
+                    pass
+                i = k + 2
+                continue
+            i = j
+            continue
+        i += 1
+    return names
+
+
+def _resolve_xo_name(res, name):
+    """在资源树里按名字找 XObject；找不到返回 None。"""
+    if res is None:
+        return None
+    xo = res.get('/XObject')
+    if xo is None:
+        return None
+    if not name.startswith('/'):
+        name = '/' + name
+    return xo.get(name)
+
+
+def _leaf_image_refs(stream_data, res, seen_forms):
+    """解析流中所有 Do 引用的叶子图片 objgen（Form 递归展开）。
+    返回 (图片 objgen 集合, 直接引用的 Form objgen 集合)。"""
+    imgs, forms = set(), set()
+    for nm in _parse_do_names(stream_data):
+        obj = _resolve_xo_name(res, nm)
+        if obj is None:
+            continue
+        try:
+            sub = obj.get('/Subtype')
+        except Exception:
+            continue
+        if sub == pikepdf.Name('/Image'):
+            imgs.add(obj.objgen)
+        elif sub == pikepdf.Name('/Form'):
+            g = obj.objgen
+            if g in forms or g in seen_forms:
+                continue
+            forms.add(g); seen_forms.add(g)
+            try:
+                fdata = obj.read_bytes()
+            except Exception:
+                fdata = b''
+            ii, _ = _leaf_image_refs(fdata, obj.get('/Resources'), seen_forms)
+            imgs |= ii
+    return imgs, forms
+
+
+def find_repeated_images(pdf, min_ratio=0.5):
+    """按『内容流实际 Do 绘制』统计重复图片水印。
+    返回 (候选 objgen 集合, 统计)。
+    候选 = 被 >= max(2, 页数*ratio) 页实际绘制的图片，以及
+    只包装候选图片的 Form 容器自身。"""
+    n = len(pdf.pages)
+    img_cnt, form_cnt = {}, {}
+    for page in pdf.pages:
+        res = page.get('/Resources')
+        imgs, forms = set(), set()
+        contents = page.Contents
+        if contents is not None:
+            streams = contents if isinstance(contents, pikepdf.Array) else [contents]
+            for s in streams:
+                if s is None:
+                    continue
+                try:
+                    data = s.read_bytes()
+                except Exception:
+                    data = b''
+                ii, ff = _leaf_image_refs(data, res, set())
+                imgs |= ii; forms |= ff
+        for g in imgs:
+            img_cnt[g] = img_cnt.get(g, 0) + 1
+        for g in forms:
+            form_cnt[g] = form_cnt.get(g, 0) + 1
+    th = max(2, int(n * min_ratio))
+    cand_imgs = {g for g, c in img_cnt.items() if c >= th}
+    cand = set(cand_imgs)
+    for g, c in form_cnt.items():
+        if c < th:
+            continue
+        try:
+            obj = pdf.get_object(g)
+            fdata = obj.read_bytes()
+            ii, _ = _leaf_image_refs(fdata, obj.get('/Resources'), {g})
+        except Exception:
+            ii = set()
+        if ii and ii <= cand_imgs:
+            cand.add(g)
+    return cand, (img_cnt, form_cnt)
+
+
+def detect_image_watermarks(path, pdf, min_ratio=0.5, min_area_ratio=0.08):
+    """完整图片水印检测：内容流 Do 计数 + 渲染面积过滤 + 包装 Form。
+    只有被多数页实际绘制、且渲染面积 >= min_area_ratio 的图片才算水印
+    （避免把每页都出现的页眉/Logo 小图误删）。返回 (候选 objgen, 统计)。"""
+    try:
+        import pymupdf as _mupdf
+    except ImportError:
+        import fitz as _mupdf
+    cand, stats = find_repeated_images(pdf, min_ratio)
+    if not cand:
+        return set(), stats
+    img_cnt, form_cnt = stats
+    doc = _mupdf.open(path)
+    keep = set()
+    for g in cand:
+        try:
+            obj = pdf.get_object(g)
+            if obj.get("/Subtype") == pikepdf.Name("/Form"):
+                continue  # 包装 Form 稍后单独判断
+        except Exception:
+            pass
+        maxr = 0.0
+        try:
+            for pno in range(doc.page_count):
+                pg = doc[pno]
+                for r in pg.get_image_rects(g[0]):
+                    area = r.width * r.height / (pg.rect.width * pg.rect.height)
+                    if area > maxr:
+                        maxr = area
+        except Exception:
+            pass
+        if maxr >= min_area_ratio:
+            keep.add(g)
+    doc.close()
+    # 纯包装 Form：其叶子图片全部命中候选才保留
+    th = max(2, int(len(pdf.pages) * min_ratio))
+    for g, c in form_cnt.items():
+        if c < th:
+            continue
+        try:
+            obj = pdf.get_object(g)
+            fdata = obj.read_bytes()
+            ii, _ = _leaf_image_refs(fdata, obj.get("/Resources"), {g})
+        except Exception:
+            ii = set()
+        if ii and ii <= keep:
+            keep.add(g)
+    return keep, stats
+
+
+def _names_to_remove(res, cand, seen_forms):
+    """返回资源树中需移除的 XObject 名字：objgen 命中候选的图片/包装 Form。"""
+    names = set()
+    if res is None:
+        return names
+    xo = res.get('/XObject')
+    if xo is None:
+        return names
+    for name, obj in xo.items():
+        if obj is None:
+            continue
+        try:
+            sub = obj.get('/Subtype')
+        except Exception:
+            continue
+        if sub == pikepdf.Name('/Image') and obj.objgen in cand:
+            names.add(name)
+        elif sub == pikepdf.Name('/Form'):
+            if obj.objgen in cand:
+                names.add(name)
+            g = obj.objgen
+            if g not in seen_forms:
+                seen_forms.add(g)
+                names |= _names_to_remove(obj.get('/Resources'), cand, seen_forms)
+    return names
+
+
+def remove_image_watermarks(pdf, cand) -> int:
+    """删除各页绘制候选图片/包装 Form 的 /name Do 操作与资源项。
+    返回删除的 Do 操作数。"""
+    total = 0
+    for page in pdf.pages:
+        res = page.get('/Resources')
+        names = _names_to_remove(res, cand, set())
+        if not names:
+            continue
+        contents = page.Contents
+        if contents is not None:
+            streams = contents if isinstance(contents, pikepdf.Array) else [contents]
+            keep = pikepdf.Array()
+            for s in streams:
+                if s is None:
+                    keep.append(s)
+                    continue
+                data = s.read_bytes()
+                new_data = data
+                for nm in names:
+                    nm_b = nm.lstrip('/').encode('latin-1')
+                    pat = re.compile(rb'/' + re.escape(nm_b) +
+                                     rb'(?![A-Za-z0-9])[ \t\r\n]*Do\b')
+                    new_data, k = pat.subn(b'', new_data)
+                    total += k
+                if new_data != data:
+                    s.write(new_data)
+                keep.append(s)
+            if isinstance(contents, pikepdf.Array):
+                page.Contents = keep
+        if res is not None:
+            xo = res.get('/XObject')
+            if xo is not None:
+                for nm in names:
+                    if nm in xo:
+                        del xo[nm]
+    return total
+
+
+def find_image_objgens(pdf, xrefs):
+    """按 xref 号过滤全部图片 objgen（手动指定模式）。"""
+    all_imgs = set()
+    for page in pdf.pages:
+        res = page.get('/Resources')
+        contents = page.Contents
+        if contents is None:
+            continue
+        streams = contents if isinstance(contents, pikepdf.Array) else [contents]
+        for s in streams:
+            if s is None:
+                continue
+            try:
+                ii, _ = _leaf_image_refs(s.read_bytes(), res, set())
+                all_imgs |= ii
+            except Exception:
+                pass
+    return {g for g in all_imgs if g[0] in xrefs}
+
+
 def clean_pdf(src: str, dst: str, keywords: list, password: str = "") -> dict:
     """打开 src，删除命中关键词的文本块，以 dst 无加密保存。
     返回 {'page_count': int, 'removed': int}。"""
@@ -306,12 +568,16 @@ def main():
     ap.add_argument("-o", "--output", default=None, help="输出 PDF（默认 <原名>_cleaned.pdf）")
     ap.add_argument("-k", "--keyword", action="append", default=[],
                     help="水印关键词，可多次指定（子串匹配）")
+    ap.add_argument("--images", action="store_true",
+                    help="图片水印模式：自动检测被多数页引用的同一图片并移除")
+    ap.add_argument("--image-xref", action="append", type=int, default=[],
+                    help="手动指定要移除的水印图片 xref（可多次）")
     ap.add_argument("--password", default="", help="打开加密 PDF 的密码（默认空）")
     ap.add_argument("--no-verify", action="store_true", help="关闭输出后的残留检查")
     args = ap.parse_args()
 
-    if not args.keyword:
-        print("错误：至少需要一个 -k 关键词", file=sys.stderr)
+    if not args.keyword and not args.images and not args.image_xref:
+        print("错误：需要 -k 关键词，或 --images / --image-xref 图片水印模式", file=sys.stderr)
         sys.exit(2)
 
     out_path = args.output or re.sub(r"\.pdf$", "", args.input, flags=re.I) + "_cleaned.pdf"
@@ -336,8 +602,28 @@ def main():
         total += n
 
     print(f"删除水印文本块: {total} 个")
-    if total == 0:
-        print("警告：没有匹配到任何水印块，请检查关键词。")
+
+    # ---- 图片水印 ----
+    img_cands = set()
+    if args.image_xref:
+        img_cands |= find_image_objgens(pdf, set(args.image_xref))
+        print(f"手动指定图片 xref: {sorted(set(args.image_xref))}")
+    if args.images:
+        auto, cnt = detect_image_watermarks(args.input, pdf, 0.5, 0.08)
+        img_cands |= auto
+        if auto:
+            shown = {f"xref{g[0]}": c for g, c in cnt[0].items() if g in auto}
+            print(f"自动检测重复图片水印(引用页数): {shown}")
+        else:
+            print("自动检测：未发现重复的大面积图片水印（可用 --image-xref 手动指定）。")
+    img_removed = 0
+    if img_cands:
+        img_removed = remove_image_watermarks(pdf, img_cands)
+        print(f"删除图片水印 Do 操作: {img_removed} 个 "
+              f"(图片 xref: {sorted(g[0] for g in img_cands)})")
+
+    if total == 0 and img_removed == 0:
+        print("警告：文本与图片均未匹配到水印，请检查关键词/图片或水印形式（矢量描边）。")
 
     pdf.save(out_path, encryption=False)
     pdf.close()

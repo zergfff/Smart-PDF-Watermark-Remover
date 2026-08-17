@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """批处理：原始/ -> 处理后/
-自动识别每份 PDF 的水印字符串（内容流级指纹收集）-> 内容流级删除 + 去加密 + 自动验证。
+自动识别每份 PDF 的水印（文本关键词 + 重复图片双通道）
+-> 内容流级删除 + 图片水印移除 + 去加密 + 自动验证。
 """
 import os
 import re
@@ -73,30 +74,54 @@ for fn in sorted(os.listdir(SRC)):
     if not fn.lower().endswith(".pdf"):
         continue
     src = os.path.join(SRC, fn)
-    dst = os.path.join(DST, fn)  # 同名输出到处理后/（默认加 _cleaned 也行）
+    dst = os.path.join(DST, fn)  # 同名输出到 处理后/
+    pdf = None
     try:
         kws = sniff_stream_keywords(src)
-        if not kws:
-            msg = "跳过：未识别到文本水印特征（可能为图片/矢量水印或本无文本水印）"
-            results.append((fn, msg))
-            print(f"{fn} => {msg}")
-            continue
+        pdf = pikepdf.open(src)
 
-        info = dw.clean_pdf(src, dst, kws)
-        v = dw.verify_residual(dst, [k.decode("utf-8", "replace") for k in kws])
-        resid = v.get("residual_pages", "?")
-        enc_off = (v.get("encrypted", None) is False)
-        if resid == 0 and enc_off:
-            status = f"OK 页数={v.get('pages')} 删除块={info['removed']} 残留页=0 加密=无"
+        # 文本通道
+        t = 0
+        for page in pdf.pages:
+            t += dw.process_page(pdf, page, kws)
+            t += dw.process_xobjects(page.get("/Resources"), kws)
+
+        # 图片通道（自动检测重复的大面积图片水印）
+        auto, cnt = dw.detect_image_watermarks(src, pdf, 0.5, 0.08)
+        ir = dw.remove_image_watermarks(pdf, auto) if auto else 0
+
+        pdf.save(dst, encryption=False)
+        pdf.close()
+        pdf = None
+
+        pdf2 = pikepdf.open(dst)
+        enc = pdf2.is_encrypted
+        pdf2.close()
+
+        if t > 0 or ir > 0:
+            detail = []
+            if t:
+                detail.append(f"文本块{t}")
+            if ir:
+                detail.append(f"图片Do{ir}(xref={sorted(g[0] for g in auto)})")
+            resid = dw.verify_residual(dst, [k.decode("utf-8", "replace") for k in kws]) \
+                if kws else {"residual_pages": 0}
+            ok = resid.get("residual_pages", 0) == 0
+            status = (f"OK 页数={dw.verify_residual(dst, [])['pages']} 删除={'+'.join(detail)} "
+                      f"残留={resid.get('residual_pages')} 加密={'无' if not enc else '有!'}")
+            print(f"{fn} => {status}")
+        elif kws:
+            print(f"{fn} => PARTIAL: 识别到文本特征但无删除匹配（可能是 CID/特殊编码文本水印）")
         else:
-            status = f"PARTIAL/F 页数={v.get('pages')} 删除块={info['removed']} 残留页={resid} 加密移除={enc_off}"
-        results.append((fn, status, len(kws)))
-        print(f"{fn} => {status} | 关键词数: {len(kws)}")
+            print(f"{fn} => 跳过：未识别到文本/图片水印特征")
     except Exception as e:
-        results.append((fn, f"ERROR: {e}"))
         print(f"{fn} => ERROR: {e}")
+    finally:
+        if pdf is not None:
+            pdf.close()
 
 print("\n===== 汇总 =====")
-for r in results:
-    print(f"[{'OK ' if r[1].startswith('OK') else '!! '}] {r[0]}  {r[1]}")
-print(f"\n共 {len(results)} 个文件, 成功 {sum(1 for r in results if r[1].startswith('OK'))} 个")
+for fn in sorted(os.listdir(SRC)):
+    if fn.lower().endswith(".pdf") and os.path.exists(os.path.join(DST, fn)):
+        print(f"[OK] {fn}")
+print("完成")

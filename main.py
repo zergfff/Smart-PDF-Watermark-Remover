@@ -650,6 +650,7 @@ class UltraAppFinal(QMainWindow):
         self.setGeometry(QApplication.primaryScreen().availableGeometry())
         self.showMaximized()
         self.refresh_ui_text()
+        self.add_log("Tip: drag & drop a PDF file anywhere to open it")
 
     def init_ui(self):
         main_widget = QWidget(); self.setCentralWidget(main_widget)
@@ -731,15 +732,49 @@ class UltraAppFinal(QMainWindow):
         render_to_label(self.doc_orig, self.lab_orig, self.scroll_orig)
         if self.doc_clean: render_to_label(self.doc_clean, self.lab_clean, self.scroll_clean)
 
+    def load_pdf(self, path):
+        """加载 PDF 文件（文件对话框与拖拽共用的入口）。"""
+        if not path or not os.path.isfile(path):
+            self.add_log(f"File not found: {path}")
+            return False
+        try:
+            self.doc_orig = fitz.open(path)
+        except Exception as ex:
+            self.add_log(f"Open failed: {os.path.basename(path)} ({ex})")
+            return False
+        self.file_path = path
+        self.display_lists = {}; self.doc_clean = None
+        self.btn_save.setEnabled(False)
+        self.page_spin.setRange(1, len(self.doc_orig)); self.page_spin.setValue(1)
+        self.add_log(f"File loaded: {os.path.basename(path)}")
+        self.refresh_ui_text()
+        self.update_previews()
+        return True
+
     def load_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "PDF", "", "PDF Files (*.pdf)")
         if path:
-            self.add_log(f"File loaded: {os.path.basename(path)}")
-            self.doc_orig = fitz.open(path); self.file_path = path
-            self.display_lists = {}; self.doc_clean = None
-            self.page_spin.setRange(1, len(self.doc_orig)); self.page_spin.setValue(1)
-            self.refresh_ui_text()
-            self.update_previews()
+            self.load_pdf(path)
+
+    # ---- PDF 拖拽打开 ----
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            urls = [u.toLocalFile() for u in event.mimeData().urls()]
+            if any(u and u.lower().endswith(".pdf") for u in urls):
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dropEvent(self, event):
+        urls = [u.toLocalFile() for u in event.mimeData().urls()]
+        pdfs = [u for u in urls if u and u.lower().endswith(".pdf")]
+        if not pdfs:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.load_pdf(pdfs[0])
+        if len(pdfs) > 1:
+            self.add_log(f"Dropped {len(pdfs)} PDFs, opened the first one.")
 
     def start_task(self):
         if not self.doc_orig: return
