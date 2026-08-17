@@ -52,6 +52,11 @@ python verify_clean.py out.pdf -k "Confidential" --body "29-11-67" \
 ```
 不加 `-o` 时输出到 `<原文件名>_cleaned.pdf`；`--verify`（默认开启）会在输出后自动检查残留。
 
+### 批处理整个文件夹
+```bash
+python batch_clean.py   # 自动识别 原始/ 里每份 PDF 的水印字符串 → 内容流级清理 → 保存到 处理后/
+```
+
 ## 🧪 真实案例
 
 `29-11-67 Rev3.pdf`（104 页，A4）：每页同一位置以约 52° 斜向绘制

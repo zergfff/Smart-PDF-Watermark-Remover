@@ -244,10 +244,13 @@ def _find_ops(stream: bytes):
     return ops
 
 
-def _split_bt_et_blocks(stream: bytes):
-    """按字符串感知的 BT/ET 把内容流切成块。返回 (块列表, 非块内容拼接)。"""
+def _split_bt_et_pieces(stream: bytes):
+    """按字符串感知的 BT/ET 切块，返回保持原始顺序的片段列表。
+    每个片段是 ('block', bytes) 或 ('rest', bytes)。
+    删除水印块时必须按此顺序重建，否则 rest/block 交错位置错乱，
+    会把相邻 token 拼成 'ETq'/'ETBT' 之类的非法操作符。"""
     ops = _find_ops(stream)
-    blocks, rest_parts = [], []
+    pieces = []
     i = 0
     k, n_ops = 0, len(ops)
     while k < n_ops:
@@ -260,18 +263,29 @@ def _split_bt_et_blocks(stream: bytes):
                     break
                 j += 1
             if e_pos is None:  # 未闭合 BT：把剩余内容整个当作块
-                rest_parts.append(stream[i:p])
-                blocks.append(stream[p:])
+                if p > i:
+                    pieces.append(("rest", stream[i:p]))
+                pieces.append(("block", stream[p:]))
                 i = len(stream)
                 break
-            rest_parts.append(stream[i:p])
-            blocks.append(stream[p:e_pos + 2])
+            if p > i:
+                pieces.append(("rest", stream[i:p]))
+            pieces.append(("block", stream[p:e_pos + 2]))
             i = e_pos + 2
             k = j + 1
         else:
             k += 1
-    rest_parts.append(stream[i:])
-    return blocks, b"".join(rest_parts)
+    if i < len(stream):
+        pieces.append(("rest", stream[i:]))
+    return pieces
+
+
+def _split_bt_et_blocks(stream: bytes):
+    """按字符串感知的 BT/ET 把内容流切成块。返回 (块列表, 非块内容拼接)。"""
+    pieces = _split_bt_et_pieces(stream)
+    blocks = [b for kind, b in pieces if kind == "block"]
+    tail = b"".join(b for kind, b in pieces if kind == "rest")
+    return blocks, tail
 
 
 def _block_matches(block: bytes, keywords: list) -> bool:
@@ -289,17 +303,17 @@ def _block_matches(block: bytes, keywords: list) -> bool:
 def _strip_watermark_stream(data: bytes, keywords: list):
     """从单个内容流中删除命中关键词的 BT..ET 块。
     返回 (新流或 None 表示流已空, 删除块数)。"""
-    blocks, tail = _split_bt_et_blocks(data)
+    pieces = _split_bt_et_pieces(data)
     kept = []
     removed = 0
-    for b in blocks:
-        if _block_matches(b, keywords):
+    for kind, b in pieces:
+        if kind == "block" and _block_matches(b, keywords):
             removed += 1
         else:
             kept.append(b)
     if removed == 0:
         return data, 0
-    new_data = b"".join(kept) + tail
+    new_data = b"".join(kept)  # 保持原始顺序；rest 与保留块交错位置不变
     # 若删除后只剩 q/Q 之类的空壳，整个流移除
     stripped = new_data.replace(b"q", b"").replace(b"Q", b"").strip()
     if not stripped:
