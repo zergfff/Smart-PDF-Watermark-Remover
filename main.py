@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import tempfile
 import xxhash
 import uuid
@@ -9,9 +10,10 @@ import pdf_dewatermark as _dw
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
-                             QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,  
-                             QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox)
-from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor
+                             QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,
+                             QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox,
+                             QMenu)
+from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize
 
 # --- 环境适配 ---
@@ -41,7 +43,20 @@ TRANSLATIONS = {
         "set_title": "软件设置",
         "set_ratio": "疑似水印识别比例 (10-100%):",
         "set_lang": "语言 (Language):",
-        "set_save": "保存设置"
+        "set_keywords": "手动水印关键词(逗号分隔):",
+        "set_save": "保存设置",
+        "cancel": "⏹ 停止",
+        "apply_all": "应用到其余所有文件",
+        "recent": "最近打开",
+        "zoom_in": "放大",
+        "zoom_out": "缩小",
+        "fit_width": "适合宽度",
+        "fit_page": "适合页面",
+        "analyzing": "分析正在进行中，请等待完成…",
+        "batch_done": "批量处理完成",
+        "batch_cancel": "已取消",
+        "verify_ok": "复检通过：无残留",
+        "verify_warn": "复检发现残留"
     },
     "en": {
         "title": "Extreme PDF Cleaner",
@@ -65,18 +80,98 @@ TRANSLATIONS = {
         "set_title": "Settings",
         "set_ratio": "Watermark Ratio (10-100%):",
         "set_lang": "Language:",
-        "set_save": "Save Settings"
+        "set_keywords": "Manual watermark keywords (comma separated):",
+        "set_save": "Save Settings",
+        "cancel": "⏹ Stop",
+        "apply_all": "Apply to all remaining files",
+        "recent": "Recent Files",
+        "zoom_in": "Zoom In",
+        "zoom_out": "Zoom Out",
+        "fit_width": "Fit Width",
+        "fit_page": "Fit Page",
+        "analyzing": "Analysis in progress, please wait...",
+        "batch_done": "Batch processing finished",
+        "batch_cancel": "Cancelled",
+        "verify_ok": "Verify passed: no residual",
+        "verify_warn": "Verify found residual"
     }
 }
 
+# --- 配置与语言 ---
+def config_path():
+    d = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ExtremePDFCleaner")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "config.json")
+
+def load_config():
+    cfg = {"lang": None, "ratio": 30, "keywords": [], "recent_files": [], "last_dir": ""}
+    try:
+        with open(config_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for k in cfg:
+                if k in data:
+                    cfg[k] = data[k]
+    except Exception:
+        pass
+    return cfg
+
+def save_config(cfg):
+    try:
+        with open(config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def detect_system_lang():
+    """根据系统 UI 语言决定首次语言：中文系统 → zh，其他 → en。"""
+    try:
+        import ctypes
+        langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        if (langid & 0x3FF) == 0x04:  # LANG_CHINESE
+            return "zh"
+    except Exception:
+        pass
+    return "en"
+
+def apply_dark_mode(app, enable):
+    """跟随系统的深色模式（注册表 AppsUseLightTheme）。"""
+    try:
+        import ctypes
+        key = ctypes.windll.advapi32.RegGetValueW
+        # 读取是否浅色主题
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            light = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 1
+        dark = (not light) if enable is None else enable
+    except Exception:
+        dark = False
+    app.setStyle("Fusion")
+    if dark:
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(35, 38, 41))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(238, 238, 238))
+        pal.setColor(QPalette.ColorRole.Base, QColor(30, 33, 36))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(42, 45, 48))
+        pal.setColor(QPalette.ColorRole.Text, QColor(238, 238, 238))
+        pal.setColor(QPalette.ColorRole.Button, QColor(48, 51, 53))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor(238, 238, 238))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(61, 139, 253))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(35, 38, 41))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor(238, 238, 238))
+        app.setPalette(pal)
+    else:
+        app.setPalette(app.style().standardPalette())
+
 # --- 设置对话框 ---
 class SettingsDialog(QDialog):
-    def __init__(self, current_ratio, current_lang, scale, parent=None):
+    def __init__(self, current_ratio, current_lang, current_keywords, scale, parent=None):
         super().__init__(parent)
         self.scale = scale
         self.t = TRANSLATIONS[current_lang]
         self.setWindowTitle(self.t["set_title"])
-        self.setFixedWidth(int(300 * scale))
+        self.setFixedWidth(int(340 * scale))
         
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(self.t["set_ratio"]))
@@ -93,13 +188,19 @@ class SettingsDialog(QDialog):
         index = self.lang_combo.findData(current_lang)
         self.lang_combo.setCurrentIndex(index if index >= 0 else 0)
         layout.addWidget(self.lang_combo)
+
+        layout.addWidget(QLabel(self.t["set_keywords"]))
+        self.keywords_edit = QLineEdit(", ".join(current_keywords))
+        self.keywords_edit.setPlaceholderText("Confidential, Internal Use Only")
+        layout.addWidget(self.keywords_edit)
         
         self.btn_save = QPushButton(self.t["set_save"])
         self.btn_save.clicked.connect(self.accept)
         layout.addWidget(self.btn_save)
 
     def get_values(self):
-        return self.ratio_spin.value(), self.lang_combo.currentData()
+        kws = [k.strip() for k in self.keywords_edit.text().replace("，", ",").split(",") if k.strip()]
+        return self.ratio_spin.value(), self.lang_combo.currentData(), kws
 
 # --- 1. 底层计算逻辑 ---
 def is_bbox_similar(bbox1, bbox2, tolerance=2.0):
@@ -486,6 +587,9 @@ class EnhancedWatermarkDialog(QDialog):
                 self.scroll_layout.addWidget(frame)
 
         scroll.setWidget(content_widget); left_side.addWidget(scroll)
+        self.apply_all_cb = QCheckBox(self.t["apply_all"])
+        self.apply_all_cb.setChecked(False)
+        left_side.addWidget(self.apply_all_cb)
         btn_ok = QPushButton(self.t["ok"]); btn_ok.clicked.connect(self.accept)
         btn_ok.setFixedHeight(int(45*scale)); left_side.addWidget(btn_ok)
         
@@ -542,6 +646,9 @@ class EnhancedWatermarkDialog(QDialog):
         txts = [{'text': i['content'], 'bbox': i['bbox'], 'size': i['size']} for i in self.text_line_boxes if i['checkbox'].isChecked()]
         return imgs, txts
 
+    def get_apply_all(self):
+        return self.apply_all_cb.isChecked()
+
 # --- 3. 后台清理工作线程 ---
 class MasterWorker(QThread):
     progress = pyqtSignal(int)
@@ -556,158 +663,266 @@ class MasterWorker(QThread):
         self.ratio_threshold = ratio_threshold / 100.0
         self.confirmed_hashes = []; self.confirmed_texts = []
         self.is_confirmed = False
+        self.stop_flag = False            # 取消标志
+        self.extra_keywords = []          # 设置里的手动关键词
+        self.batch_files = []             # 批量模式文件列表（空 = 单文件）
+        self.apply_all_requested = False  # 确认弹窗勾选"应用到全部"
+        self.apply_all_confirms = None    # 批量复用的确认项 (hashes, texts)
 
     def run(self):
         try:
-            self.log_signal.emit(">>> Starting analysis...")
-            doc = fitz.open(self.file_path)
-            total = len(doc); all_page_results = []
-            cpu_count = max(1, (os.cpu_count() or 4) - 1)
-            chunk_size = max(1, total // cpu_count)
-            ranges = [list(range(i, min(i + chunk_size, total))) for i in range(0, total, chunk_size)]
-            
-            self.log_signal.emit(f">>> PDF loaded: {total} pages. Using {cpu_count} CPU cores.")
-            
-            with ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                futures = [executor.submit(analyze_chunk_worker, self.file_path, r) for r in ranges]
-                for i, f in enumerate(futures):
-                    res, errs = f.result()
-                    all_page_results.extend(res)
-                    for e in errs: self.log_signal.emit(f"Worker Warning: {e}")
-                    self.log_signal.emit(f">>> Scanning progress: {int((i+1)/len(futures)*100)}%")
-
-            size_groups = {}
-            for data in all_page_results:
-                size_groups.setdefault(data['size_key'], []).append(data)
-
-            final_img_candidates = {}; final_txt_candidates = {}
-            for size_key, pages in size_groups.items():
-                group_count = len(pages)
-                threshold = max(2, group_count * self.ratio_threshold) 
-                img_counts = {}; txt_counts = {}
-                for p in pages:
-                    unique_hashes = set(img['hash'] for img in p['imgs'])
-                    for h in unique_hashes:
-                        img_counts[h] = img_counts.get(h, 0) + 1
-                        if h not in final_img_candidates:
-                            for img in p['imgs']:
-                                if img['hash'] == h:
-                                    img_rect = doc[p['index']].get_image_rects(img['xref'])[0]
-                                    final_img_candidates[h] = {'xref': img['xref'], 'count': 0, 'sample_page': p['index'], 'sample_bbox': tuple(img_rect)}
-                    for t in p['texts']:
-                        # 聚类 key：文本内容+字号（不再要求 bbox 完全一致，避免旋转/舍入差异导致匹配失败）
-                        tk = (t['text'], t['size'], size_key)
-                        txt_counts[tk] = txt_counts.get(tk, 0) + 1
-                        if tk not in final_txt_candidates:
-                            final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0, 'bbox': t['bbox']}
-
-                for h, count in img_counts.items():
-                    if count >= threshold: final_img_candidates[h]['count'] += count
-                for tk, count in txt_counts.items():
-                    if count >= threshold: final_txt_candidates[tk]['count'] += count
-
-            final_img_candidates = {k: v for k, v in final_img_candidates.items() if v['count'] > 0}
-            final_txt_candidates = {k: v for k, v in final_txt_candidates.items() if v['count'] > 0}
-
-            self.log_signal.emit(">>> Waiting for user confirmation...")
-            self.need_confirm.emit(final_img_candidates, final_txt_candidates)
-            while not self.is_confirmed: self.msleep(50)
-            
-            self.log_signal.emit(">>> Applying cleaning process...")
-            # ---- 1) 图片水印：收集用户确认的图片 xref（哈希反查，原始文件）----
-            confirmed_xrefs = set()
-            for i in range(total):
-                page = doc[i]
-                for img in page.get_images(full=True):
-                    try:
-                        pix = fitz.Pixmap(doc, img[0])
-                        if xxhash.xxh64(pix.samples).hexdigest() in self.confirmed_hashes:
-                            confirmed_xrefs.add(img[0])
-                    except Exception:
-                        continue
-                self.progress.emit(int((i + 1) / total * 50))
-
-            # ---- 2) pikepdf 内容流级删除（文本 BT..ET 块 + 图片 Do 操作）并去权限 ----
-            #        直接打开原始文件——不能用 fitz 先重写，否则 xref 重编号，
-            #        哈希反查到的图片号会匹配不上导致删除为 0
-            keywords = [c['text'].encode('utf-8') for c in self.confirmed_texts]
-            removed_total = 0
-            img_removed = 0
-            try:
-                pdf = pikepdf.open(self.file_path)
-            except Exception:
-                # 加密等无法直接打开时，退回 fitz 转存后再处理（尽力而为）
-                tmp_imgs = os.path.join(tempfile.gettempdir(),
-                                        f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
-                doc.save(tmp_imgs, garbage=4, deflate=True)
-                pdf = pikepdf.open(tmp_imgs)
-            doc.close()
-            for i, page in enumerate(pdf.pages):
-                n = _wm_process_page(pdf, page, keywords)
-                n += _wm_process_xobjects(page.get("/Resources"), keywords)
-                removed_total += n
-                self.progress.emit(50 + int((i + 1) / total * 50))
-            if confirmed_xrefs:
-                img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
-                img_removed = _dw.remove_image_watermarks(pdf, img_cand)
-            out_tmp = os.path.join(tempfile.gettempdir(),
-                                   f"__wm_final_{uuid.uuid4().hex}_{os.path.basename(self.file_path)}")
-            pdf.save(out_tmp, encryption=False)
-            pdf.close()
-            self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
-            self.log_signal.emit(">>> Done! Cleaned PDF is ready for preview/save.")
-            self.finished.emit(fitz.open(out_tmp))
+            files = self.batch_files or [self.file_path]
+            outputs = []
+            for fi, fpath in enumerate(files):
+                if self.stop_flag:
+                    self.log_signal.emit(">>> Cancelled.")
+                    break
+                self.is_confirmed = False
+                self.confirmed_hashes = []
+                self.confirmed_texts = []
+                if len(files) > 1:
+                    self.log_signal.emit(f">>> [{fi+1}/{len(files)}] {os.path.basename(fpath)}")
+                out_path = self._process_one(fpath, fi, len(files))
+                if self.stop_flag:
+                    self.log_signal.emit(">>> Cancelled.")
+                    break
+                if out_path:
+                    outputs.append(out_path)
+            if outputs and not self.stop_flag:
+                self.log_signal.emit(f">>> Batch processing finished: {len(outputs)} file(s)")
+                try:
+                    self.finished.emit(fitz.open(outputs[-1]))
+                except Exception:
+                    self.finished.emit(None)
+            elif self.stop_flag or not outputs:
+                self.failed.emit()
         except Exception as e:
             self.log_signal.emit(f"Error: {e}")
             self.failed.emit()
+
+    def _process_one(self, fpath, fi, nfiles):
+        """处理单个文件：分析 → 确认 → 清理 → 复检。返回输出路径或 None。"""
+        self.log_signal.emit(">>> Starting analysis...")
+        doc = fitz.open(fpath)
+        total = len(doc)
+        cpu_count = max(1, (os.cpu_count() or 4) - 1)
+        chunk_size = max(1, total // cpu_count)
+        ranges = [list(range(i, min(i + chunk_size, total))) for i in range(0, total, chunk_size)]
+        self.log_signal.emit(f">>> PDF loaded: {total} pages. Using {cpu_count} CPU cores.")
+        all_page_results = []
+        with ProcessPoolExecutor(max_workers=cpu_count) as executor:
+            futures = [executor.submit(analyze_chunk_worker, fpath, r) for r in ranges]
+            for i, f in enumerate(futures):
+                if self.stop_flag:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    doc.close()
+                    return None
+                res, errs = f.result()
+                all_page_results.extend(res)
+                for e in errs:
+                    self.log_signal.emit(f"Worker Warning: {e}")
+                self.log_signal.emit(f">>> Scanning progress: {int((i+1)/len(futures)*100)}%")
+
+        size_groups = {}
+        for data in all_page_results:
+            size_groups.setdefault(data['size_key'], []).append(data)
+
+        final_img_candidates = {}; final_txt_candidates = {}
+        for size_key, pages in size_groups.items():
+            group_count = len(pages)
+            threshold = max(2, group_count * self.ratio_threshold)
+            img_counts = {}; txt_counts = {}
+            for p in pages:
+                unique_hashes = set(img['hash'] for img in p['imgs'])
+                for h in unique_hashes:
+                    img_counts[h] = img_counts.get(h, 0) + 1
+                    if h not in final_img_candidates:
+                        for img in p['imgs']:
+                            if img['hash'] == h:
+                                img_rect = doc[p['index']].get_image_rects(img['xref'])[0]
+                                final_img_candidates[h] = {'xref': img['xref'], 'count': 0,
+                                                           'sample_page': p['index'],
+                                                           'sample_bbox': tuple(img_rect)}
+                for t in p['texts']:
+                    tk = (t['text'], t['size'], size_key)
+                    txt_counts[tk] = txt_counts.get(tk, 0) + 1
+                    if tk not in final_txt_candidates:
+                        final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0, 'bbox': t['bbox']}
+            for h, count in img_counts.items():
+                if count >= threshold:
+                    final_img_candidates[h]['count'] += count
+            for tk, count in txt_counts.items():
+                if count >= threshold:
+                    final_txt_candidates[tk]['count'] += count
+
+        final_img_candidates = {k: v for k, v in final_img_candidates.items() if v['count'] > 0}
+        final_txt_candidates = {k: v for k, v in final_txt_candidates.items() if v['count'] > 0}
+
+        # 确认环节：批量且已有复用确认项时跳过弹窗
+        ic, tc = list(self.confirmed_hashes), list(self.confirmed_texts)
+        if self.apply_all_confirms is not None:
+            ic, tc = list(self.apply_all_confirms[0]), list(self.apply_all_confirms[1])
+            self.log_signal.emit(">>> Applying previous selections to this file...")
+        else:
+            self.log_signal.emit(">>> Waiting for user confirmation...")
+            self.need_confirm.emit(final_img_candidates, final_txt_candidates)
+            while not self.is_confirmed and not self.stop_flag:
+                self.msleep(50)
+            if self.stop_flag:
+                doc.close()
+                return None
+            ic, tc = list(self.confirmed_hashes), list(self.confirmed_texts)
+            if self.apply_all_requested and nfiles > 1:
+                self.apply_all_confirms = (list(ic), list(tc))
+
+        self.log_signal.emit(">>> Applying cleaning process...")
+        keywords = [c['text'].encode('utf-8') for c in tc] + \
+                   [k.encode('utf-8') for k in self.extra_keywords]
+        confirmed_xrefs = set()
+        for i in range(total):
+            page = doc[i]
+            for img in page.get_images(full=True):
+                try:
+                    pix = fitz.Pixmap(doc, img[0])
+                    if xxhash.xxh64(pix.samples).hexdigest() in set(ic):
+                        confirmed_xrefs.add(img[0])
+                except Exception:
+                    continue
+            self.progress.emit(int((i + 1) / total * 30))
+
+        try:
+            pdf = pikepdf.open(fpath)
+        except Exception:
+            # 加密等无法直接打开时，退回 fitz 转存后再处理（尽力而为）
+            tmp_imgs = os.path.join(tempfile.gettempdir(),
+                                    f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(fpath)}")
+            doc.save(tmp_imgs, garbage=4, deflate=True)
+            pdf = pikepdf.open(tmp_imgs)
+        doc.close()
+
+        removed_total = 0
+        for i, page in enumerate(pdf.pages):
+            if self.stop_flag:
+                pdf.close()
+                return None
+            n = _wm_process_page(pdf, page, keywords)
+            n += _wm_process_xobjects(page.get("/Resources"), keywords)
+            removed_total += n
+            self.progress.emit(30 + int((i + 1) / total * 30))
+        img_removed = 0
+        if confirmed_xrefs:
+            img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
+            img_removed = _dw.remove_image_watermarks(pdf, img_cand)
+
+        if self.batch_files:
+            out_path = os.path.join(os.path.dirname(fpath),
+                                    os.path.splitext(os.path.basename(fpath))[0] + "_cleaned.pdf")
+        else:
+            out_path = os.path.join(tempfile.gettempdir(),
+                                    f"__wm_final_{uuid.uuid4().hex}_{os.path.basename(fpath)}")
+        pdf.save(out_path, encryption=False)
+        pdf.close()
+        self.progress.emit(100)
+
+        # 复检：文本残留页 + 图片 xref 残留
+        resid = 0
+        left_imgs = []
+        try:
+            chk = fitz.open(out_path)
+            for pg in chk:
+                t = pg.get_text()
+                if any(k.decode('utf-8', 'replace').lower() in t.lower() for k in keywords):
+                    resid += 1
+            left_imgs = [g for pg in chk for g in pg.get_images(full=True) if g[0] in confirmed_xrefs]
+            chk.close()
+        except Exception:
+            pass
+        self.log_signal.emit(f">>> 文本水印块删除: {removed_total} 个；图片水印 Do 删除: {img_removed} 个；权限限制已移除")
+        if resid == 0 and not left_imgs:
+            self.log_signal.emit(">>> Verify passed: no residual")
+        else:
+            self.log_signal.emit(f">>> Verify warning: text residual {resid} pages, image residual {len(left_imgs)}")
+        return out_path
 
 # --- 4. 主程序窗口 ---
 class UltraAppFinal(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.config = load_config()
+        # 首次启动按系统语言；之后按用户最后选择
+        self.lang = self.config.get("lang") or detect_system_lang()
         self.doc_orig = self.doc_clean = None
         self.display_lists = {}; self.file_path = ""
-        self.ratio_threshold = 30
-        self.lang = "en"
+        self.ratio_threshold = self.config.get("ratio", 30)
+        self.extra_keywords = list(self.config.get("keywords", []))
         self.worker = None
-        
+        self.zoom = 1.0
+        self.fit_mode = "fit_page"   # fit_page / fit_width / custom
+        self.batch_files = []
+
         self.scale = QApplication.primaryScreen().logicalDotsPerInch() / 96.0
         self.init_ui(); self.setAcceptDrops(True)
         self.setGeometry(QApplication.primaryScreen().availableGeometry())
         self.showMaximized()
         self.refresh_ui_text()
-        self.add_log("Tip: drag & drop a PDF file anywhere to open it")
+        self.add_log("Tip: drag & drop PDF file(s) anywhere to open / batch clean")
 
     def init_ui(self):
         main_widget = QWidget(); self.setCentralWidget(main_widget)
         layout = QHBoxLayout(main_widget); sidebar = QVBoxLayout()
-        
+
+        # 菜单栏：文件(打开/最近文件/退出)
+        menubar = self.menuBar()
+        self.menu_file = menubar.addMenu("File")
+        act_open = self.menu_file.addAction("Open...")
+        act_open.triggered.connect(self.load_file_dialog)
+        self.menu_recent = self.menu_file.addMenu("Recent Files")
+        act_exit = self.menu_file.addAction("Exit")
+        act_exit.triggered.connect(self.close)
+
         self.btn_open = QPushButton(); self.btn_clean = QPushButton()
         self.btn_save = QPushButton(); self.btn_save.setEnabled(False)
+        self.btn_cancel = QPushButton(); self.btn_cancel.setEnabled(False)
         self.btn_settings = QPushButton()
         self.pbar = QProgressBar(); self.log_output = QTextEdit(); self.log_output.setReadOnly(True)
-        
-        for b in [self.btn_open, self.btn_clean, self.btn_save, self.btn_settings]:
-            b.setFixedHeight(int(50 * self.scale)); sidebar.addWidget(b)
+
+        for b in [self.btn_open, self.btn_clean, self.btn_save, self.btn_cancel, self.btn_settings]:
+            b.setFixedHeight(int(42 * self.scale)); sidebar.addWidget(b)
         sidebar.addWidget(self.log_output); sidebar.addWidget(self.pbar)
-        
+
         viewer = QVBoxLayout(); nav = QHBoxLayout()
         self.page_spin = QSpinBox(); self.total_label = QLabel("/ 0")
         nav.addStretch(); nav.addWidget(self.page_spin); nav.addWidget(self.total_label); nav.addStretch()
+        # 缩放控制
+        self.btn_zo = QPushButton("−"); self.btn_zi = QPushButton("+")
+        self.btn_fw = QPushButton(); self.btn_fp = QPushButton()
+        self.zoom_label = QLabel("100%")
+        for b in [self.btn_zo, self.btn_zi, self.btn_fw, self.btn_fp]:
+            b.setFixedHeight(int(28 * self.scale))
+        nav.addWidget(self.btn_zo); nav.addWidget(self.zoom_label); nav.addWidget(self.btn_zi)
+        nav.addWidget(self.btn_fw); nav.addWidget(self.btn_fp)
         comp = QHBoxLayout()
         self.scroll_orig = QScrollArea(); self.lab_orig = QLabel()
         self.scroll_clean = QScrollArea(); self.lab_clean = QLabel()
         for s, l in [(self.scroll_orig, self.lab_orig), (self.scroll_clean, self.lab_clean)]:
-            l.setAlignment(Qt.AlignmentFlag.AlignCenter); s.setWidget(l); s.setWidgetResizable(True)
-            s.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); s.installEventFilter(self)
+            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            s.setWidget(l)
+            s.setWidgetResizable(False)
+            s.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            s.installEventFilter(self)
         comp.addWidget(self.scroll_orig); comp.addWidget(self.scroll_clean)
         viewer.addLayout(nav); viewer.addLayout(comp)
-        
+
         layout.addLayout(sidebar, 1); layout.addLayout(viewer, 4)
         self.btn_open.clicked.connect(self.load_file_dialog)
         self.btn_clean.clicked.connect(self.start_task)
         self.btn_save.clicked.connect(self.save_as_pdf)
+        self.btn_cancel.clicked.connect(self.stop_task)
         self.btn_settings.clicked.connect(self.show_settings)
+        self.btn_zo.clicked.connect(lambda: self.zoom_by(0.8))
+        self.btn_zi.clicked.connect(lambda: self.zoom_by(1.25))
+        self.btn_fw.clicked.connect(lambda: self.set_fit("fit_width"))
+        self.btn_fp.clicked.connect(lambda: self.set_fit("fit_page"))
         self.page_spin.valueChanged.connect(self.update_previews)
 
     def refresh_ui_text(self):
@@ -716,16 +931,36 @@ class UltraAppFinal(QMainWindow):
         self.btn_open.setText(t["open"])
         self.btn_clean.setText(t["clean"])
         self.btn_save.setText(t["save"])
+        self.btn_cancel.setText(t["cancel"])
         self.btn_settings.setText(t["settings"])
+        self.btn_fw.setText(t["fit_width"])
+        self.btn_fp.setText(t["fit_page"])
+        self.menu_file.setTitle(t["recent"] if False else "File")
+        self.menu_recent.setTitle(t["recent"])
         self.lab_orig.setText(t["orig"])
         self.lab_clean.setText(t["cleaned"])
         if self.doc_orig:
             self.total_label.setText(f"/ {len(self.doc_orig)} {t['page']}")
+        self.rebuild_recent_menu()
+
+    def rebuild_recent_menu(self):
+        self.menu_recent.clear()
+        for p in list(self.config.get("recent_files", []))[:10]:
+            if os.path.isfile(p):
+                act = self.menu_recent.addAction(os.path.basename(p))
+                act.setToolTip(p)
+                act.triggered.connect(lambda _=False, pp=p: self.load_pdf(pp))
+        if self.menu_recent.isEmpty():
+            self.menu_recent.addAction("(empty)").setEnabled(False)
 
     def show_settings(self):
-        dialog = SettingsDialog(self.ratio_threshold, self.lang, self.scale, self)
+        dialog = SettingsDialog(self.ratio_threshold, self.lang, self.extra_keywords, self.scale, self)
         if dialog.exec():
-            self.ratio_threshold, self.lang = dialog.get_values()
+            self.ratio_threshold, self.lang, self.extra_keywords = dialog.get_values()
+            self.config["ratio"] = self.ratio_threshold
+            self.config["lang"] = self.lang
+            self.config["keywords"] = self.extra_keywords
+            save_config(self.config)
             self.refresh_ui_text()
 
     def add_log(self, text):
@@ -733,33 +968,74 @@ class UltraAppFinal(QMainWindow):
         self.log_output.moveCursor(QTextCursor.MoveOperation.End)
 
     def eventFilter(self, source, event):
+        # Ctrl+滚轮 = 缩放；普通滚轮交给滚动条（放大时滚动页面）
         if event.type() == QEvent.Type.Wheel and self.doc_orig:
-            delta = event.angleDelta().y()
-            if delta > 0: self.page_spin.setValue(self.page_spin.value() - 1)
-            else: self.page_spin.setValue(self.page_spin.value() + 1)
-            return True
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                delta = event.angleDelta().y()
+                self.zoom_by(1.2 if delta > 0 else 1 / 1.2)
+                event.accept()
+                return True
         return super().eventFilter(source, event)
 
+    def keyPressEvent(self, event):
+        if self.doc_orig:
+            if event.key() == Qt.Key.Key_Left:
+                self.page_spin.setValue(self.page_spin.value() - 1)
+                return
+            if event.key() == Qt.Key.Key_Right:
+                self.page_spin.setValue(self.page_spin.value() + 1)
+                return
+        super().keyPressEvent(event)
+
+    def zoom_by(self, factor):
+        self.fit_mode = "custom"
+        self.zoom = max(0.2, min(6.0, self.zoom * factor))
+        self.zoom_label.setText(f"{int(self.zoom * 100)}%")
+        self.update_previews()
+
+    def set_fit(self, mode):
+        self.fit_mode = mode
+        self.update_previews()
+
     def update_previews(self):
-        if not self.doc_orig: return
+        if not self.doc_orig:
+            return
         idx = self.page_spin.value() - 1
+
+        def compute_zoom(doc, scroll):
+            if self.fit_mode == "fit_page":
+                vw, vh = scroll.viewport().width() - 10, scroll.viewport().height() - 10
+                return min(vw / doc[idx].rect.width, vh / doc[idx].rect.height)
+            if self.fit_mode == "fit_width":
+                vw = scroll.viewport().width() - 10
+                return vw / doc[idx].rect.width
+            return self.zoom
+
         def render_to_label(doc, lab, scroll):
             try:
-                page_data = self.display_lists.get(idx) if doc == self.doc_orig else doc[idx]
-                if doc == self.doc_orig and idx not in self.display_lists:
-                    self.display_lists[idx] = doc[idx].get_displaylist()
-                    page_data = self.display_lists[idx]
-                target_w, target_h = scroll.viewport().width() - 5, scroll.viewport().height() - 5
-                zoom = min(target_w / doc[idx].rect.width, target_h / doc[idx].rect.height)
-                pix = page_data.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                lab.setPixmap(QPixmap.fromImage(QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)))
+                z = compute_zoom(doc, scroll)
+                pix = doc[idx].get_pixmap(matrix=fitz.Matrix(z, z))
+                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                lab.setPixmap(QPixmap.fromImage(qimg))
+                lab.setFixedSize(pix.width, pix.height)  # 尺寸超过视口时滚动条出现
+                if self.fit_mode != "custom":
+                    self.zoom_label.setText(f"{int(z * 100)}%")
             except Exception as e:
                 lab.setText(f"Render error: {e}")
         render_to_label(self.doc_orig, self.lab_orig, self.scroll_orig)
-        if self.doc_clean: render_to_label(self.doc_clean, self.lab_clean, self.scroll_clean)
+        if self.doc_clean:
+            render_to_label(self.doc_clean, self.lab_clean, self.scroll_clean)
+
+    def _update_recent(self, path):
+        rec = [p for p in self.config.get("recent_files", []) if p != path]
+        rec.insert(0, path)
+        self.config["recent_files"] = rec[:10]
+        self.config["last_dir"] = os.path.dirname(path)
+        save_config(self.config)
+        self.rebuild_recent_menu()
 
     def load_pdf(self, path):
-        """加载 PDF 文件（文件对话框与拖拽共用的入口）。"""
+        """加载 PDF 文件（文件对话框、拖拽、最近文件共用的入口）。"""
         if not path or not os.path.isfile(path):
             self.add_log(f"File not found: {path}")
             return False
@@ -773,16 +1049,18 @@ class UltraAppFinal(QMainWindow):
         self.btn_save.setEnabled(False)
         self.page_spin.setRange(1, len(self.doc_orig)); self.page_spin.setValue(1)
         self.add_log(f"File loaded: {os.path.basename(path)}")
+        self._update_recent(path)
         self.refresh_ui_text()
         self.update_previews()
         return True
 
     def load_file_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "PDF", "", "PDF Files (*.pdf)")
+        start = self.config.get("last_dir") or ""
+        path, _ = QFileDialog.getOpenFileName(self, "PDF", start, "PDF Files (*.pdf)")
         if path:
             self.load_pdf(path)
 
-    # ---- PDF 拖拽打开 ----
+    # ---- PDF 拖拽打开 / 批量 ----
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             urls = [u.toLocalFile() for u in event.mimeData().urls()]
@@ -798,47 +1076,75 @@ class UltraAppFinal(QMainWindow):
             event.ignore()
             return
         event.acceptProposedAction()
-        self.load_pdf(pdfs[0])
-        if len(pdfs) > 1:
-            self.add_log(f"Dropped {len(pdfs)} PDFs, opened the first one.")
+        if len(pdfs) == 1:
+            self.batch_files = []
+            self.load_pdf(pdfs[0])
+        else:
+            self.batch_files = pdfs
+            self.load_pdf(pdfs[0])
+            self.add_log(f"Dropped {len(pdfs)} PDFs -> batch clean mode. Click Analyze to process all.")
+            self.add_log("  提示: 第一个文件的确认勾选可'应用到其余所有文件'")
 
     def start_task(self):
-        if not self.doc_orig: return
+        if not self.doc_orig:
+            return
         if self.worker is not None and self.worker.isRunning():
-            self.add_log(">>> 分析正在进行中，请等待完成…")
+            self.add_log(">>> " + TRANSLATIONS[self.lang]["analyzing"])
             return
         self.pbar.setValue(0)
         self.btn_clean.setEnabled(False)
-        self.worker = MasterWorker(self.file_path, self.ratio_threshold)
+        self.btn_cancel.setEnabled(True)
+        files = self.batch_files if len(self.batch_files) > 1 else [self.file_path]
+        self.worker = MasterWorker(files[0], self.ratio_threshold)
+        self.worker.batch_files = files if len(files) > 1 else []
+        self.worker.extra_keywords = list(self.extra_keywords)
         self.worker.progress.connect(self.pbar.setValue)
         self.worker.log_signal.connect(self.add_log)
         self.worker.need_confirm.connect(self.ask_user)
         self.worker.finished.connect(self.task_done)
-        self.worker.failed.connect(lambda: self.btn_clean.setEnabled(True))
+        self.worker.failed.connect(lambda: (self.btn_clean.setEnabled(True),
+                                            self.btn_cancel.setEnabled(False)))
         self.worker.start()
+
+    def stop_task(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop_flag = True
+            self.add_log(">>> 正在停止…")
+            self.btn_cancel.setEnabled(False)
 
     def ask_user(self, ic, tc):
         dialog = EnhancedWatermarkDialog(ic, tc, self.doc_orig, lang=self.lang, scale=self.scale, parent=self)
         if dialog.exec():
             h, t = dialog.get_selection()
             self.worker.confirmed_hashes, self.worker.confirmed_texts = h, t
+            self.worker.apply_all_requested = dialog.get_apply_all()
             self.add_log(f"User confirmed: {len(h)} images, {len(t)} text blocks selected.")
         else:
             self.add_log("Clean process cancelled by user.")
         self.worker.is_confirmed = True
 
     def task_done(self, doc):
-        self.doc_clean = doc; self.btn_save.setEnabled(True)
         self.btn_clean.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        if doc is None:
+            return
+        self.doc_clean = doc
+        self.btn_save.setEnabled(True)
         self.update_previews()
 
     def save_as_pdf(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save", f"cleaned_{os.path.basename(self.file_path)}", "PDF (*.pdf)")
-        if path: 
+        if self.doc_clean is None:
+            return
+        default = os.path.join(os.path.dirname(self.file_path),
+                               f"cleaned_{os.path.basename(self.file_path)}")
+        path, _ = QFileDialog.getSaveFileName(self, "Save", default, "PDF (*.pdf)")
+        if path:
             self.doc_clean.save(path, garbage=4, deflate=True)
             self.add_log(f"Saved to: {path}")
 
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-    app = QApplication(sys.argv); window = UltraAppFinal(); sys.exit(app.exec())
+    app = QApplication(sys.argv)
+    apply_dark_mode(app, None)  # 跟随系统深色/浅色
+    window = UltraAppFinal(); sys.exit(app.exec())
