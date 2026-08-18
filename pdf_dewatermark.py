@@ -273,9 +273,67 @@ def _block_text_signature(blk: bytes):
     return (eff_size, rot, ox, oy)
 
 
+def _strip_block_single_draw(blk: bytes, targets: list) -> tuple:
+    """块内精确删除：解析块内各 Tj/TJ 绘制片段，只删几何签名命中目标的片段。
+    返回 (新块字节, 删除片段数)。"""
+    import math as _math
+    ops = []
+    for m in re.finditer(rb"/[\w.#]+\s+([-\d.]+)\s+Tf", blk):
+        ops.append((m.start(), "Tf", float(m.group(1))))
+    for m in re.finditer(rb"([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm", blk):
+        ops.append((m.start(), "Tm", [float(m.group(i)) for i in range(1, 7)]))
+    for m in re.finditer(rb"([-\d.]+)\s+([-\d.]+)\s+Td", blk):
+        ops.append((m.start(), "Td", [float(m.group(1)), float(m.group(2))]))
+    for m in re.finditer(rb"\[[^\]]*\]\s*TJ|\([^)]*\)\s*Tj", blk):
+        ops.append((m.start(), "draw", m.end()))
+    ops.sort(key=lambda x: x[0])
+
+    M = [1, 0, 0, 1, 0, 0]
+    tm = None
+    size = None
+    draws = []
+    for pos, op, val in ops:
+        if op == "Tf":
+            size = val
+        elif op == "cm":
+            M = _mmult(M, val)
+        elif op == "Tm":
+            tm = list(val)
+        elif op == "Td":
+            if tm is None:
+                tm = [1, 0, 0, 1, 0, 0]
+            tm[4] += val[0]
+            tm[5] += val[1]
+        elif op == "draw":
+            if tm is not None and size is not None:
+                eff_size = size * tm[0]
+                a1, b1, c1, d1, e1, f1 = M
+                a2, b2, c2, d2, e2, f2 = tm
+                ca = a1 * a2 + b1 * c2
+                cb = a1 * b2 + b1 * d2
+                ox = e1 * a2 + f1 * c2 + e2
+                oy = e1 * b2 + f1 * d2 + f2
+                rot = _math.degrees(_math.atan2(cb, ca))
+                hit = False
+                for tsz, trot, tox, toy in targets:
+                    if (abs(eff_size - tsz) <= 1.0 and _ang_diff(rot, trot) <= 6.0 and
+                            abs(ox - tox) <= 6.0 and abs(oy - toy) <= 6.0):
+                        hit = True
+                        break
+                draws.append((pos, val, hit))
+    removed = 0
+    new = bytearray(blk)
+    for start, end, hit in reversed(draws):
+        if hit:
+            # 只删字符串字面量起始到操作符结束（保留 Tf/Tm/Td 状态；多余状态无害）
+            del new[start:end]
+            removed += 1
+    return bytes(new), removed
+
+
 def strip_watermark_blocks_geo(data: bytes, targets: list,
                                tol_size=1.0, tol_rot=6.0, tol_xy=20.0) -> tuple:
-    """按几何签名删除文本块。targets = [(字号, 旋转, 起点x, 起点y), ...]。"""
+    """按几何签名删除文本块（块内精确删除命中片段，保留同块其他内容）。"""
     pieces = split_bt_et_pieces(data)
     kept = []
     removed = 0
@@ -291,17 +349,23 @@ def strip_watermark_blocks_geo(data: bytes, targets: list,
                             abs(sig[3] - toy) <= tol_xy):
                         hit = True
                         break
-            if hit:
-                removed += 1
-                continue
-        kept.append(b)
+                if hit:
+                    nb, nremoved = _strip_block_single_draw(b, targets)
+                    removed += nremoved
+                    if nremoved > 0:
+                        if nb.strip() in (b"", b"q", b"Q"):
+                            continue
+                        kept.append(nb)
+                        continue
+            kept.append(b)
+        else:
+            kept.append(b)
     if removed == 0:
         return data, 0
     new_data = b"".join(kept)
     if new_data.strip() in (b"", b"q", b"Q", b"q\nQ", b"Q\nq"):
         return None, removed
     return new_data, removed
-
 
 def _scan_do_ctms(data: bytes) -> dict:
     """扫描内容流：返回 {Form名: [绘制时 CTM, ...]}（考虑 q/Q 状态栈）。"""
@@ -409,12 +473,18 @@ def _process_form_geo(obj, m_total, targets):
                 rot2 = rot + math.degrees(math.atan2(M[1], M[0]))
                 for tsz, trot, tox, toy in targets:
                     if (abs(sz - tsz) <= 1.0 and _ang_diff(rot2, trot) <= 6.0 and
-                            abs(px - tox) <= 20.0 and abs(py - toy) <= 20.0):
+                            abs(px - tox) <= 6.0 and abs(py - toy) <= 6.0):
                         hit = True
                         break
             if hit:
-                removed += 1
-                continue
+                # 块内精确删除：只删命中片段，保留同块其他内容
+                nb, nremoved = _strip_block_single_draw(b, targets)
+                removed += nremoved
+                if nremoved > 0:
+                    if nb.strip() in (b"", b"q", b"Q"):
+                        continue
+                    kept.append(nb)
+                    continue
         kept.append(b)
     if removed:
         new_data = b"".join(kept)
@@ -445,6 +515,50 @@ def _process_form_children(res, m_total, targets):
         if sub == pikepdf.Name("/Form"):
             total += _process_form_geo(obj, m_total, targets)
     return total
+
+
+def locate_text_instances(path, text, size=None, rot=None, pages=None):
+    """用 PyMuPDF 在页面上定位候选文本的所有实例位置（可解码 CID）。
+    返回 {页索引: [(bbox...), ...]}，只匹配文本相同且 size 接近的实例。"""
+    try:
+        import fitz as _f
+    except ImportError:
+        import pymupdf as _f
+    doc = _f.open(path)
+    want = text.replace(" ", "").strip()
+    out = {}
+    page_list = pages if pages is not None else range(doc.page_count)
+    for pno in page_list:
+        if pno >= doc.page_count:
+            continue
+        hits = []
+        for b in doc[pno].get_text("rawdict")["blocks"]:
+            if b["type"] != 0:
+                continue
+            for line in b["lines"]:
+                # 同 span 拼接（去空格，与采集端一致）
+                segs = []
+                for sp in line["spans"]:
+                    t = "".join(ch.get("c", "") for ch in sp.get("chars", []))
+                    if t == "":
+                        continue
+                    sz = round(sp.get("size", 0) or 0, 1)
+                    col = sp.get("color")
+                    if segs and segs[-1][0] == sz and segs[-1][2] == col:
+                        segs[-1][1] += t
+                    else:
+                        segs.append([sz, t, col, sp.get("bbox") or (0,0,0,0)])
+                for sz, t, col, bb in segs:
+                    t2 = t.replace(" ", "").strip()
+                    if t2 != want:
+                        continue
+                    if size and abs(sz - size) > max(2.0, size * 0.25):
+                        continue
+                    hits.append((bb[0], bb[1], bb[2], bb[3]))
+        if hits:
+            out[pno] = hits
+    doc.close()
+    return out
 
 
 def process_page_geo(pdf, page, geo_targets) -> int:

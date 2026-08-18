@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
                              QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,
                              QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox,
                              QMenu, QScrollBar, QRubberBand)
-from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize, QRect, QPoint
+from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette, QTransform
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize, QRect, QPoint, QRectF
 
 # --- 环境适配 ---
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
@@ -246,13 +246,29 @@ def analyze_chunk_worker(file_path, page_indices):
                     if b["type"] != 0: continue
                     for line in b["lines"]:
                         spans = line["spans"]
-                        content = "".join(ch.get("c", "")
-                                           for sp in spans for ch in sp.get("chars", [])).strip()
-                        if len(content) > 1:
-                            bbox = tuple([round(v, 1) for v in line["bbox"]])
-                            size = round(max(sp.get("size", 0) for sp in spans), 1)
+                        # 按 span 拆分：同 size 相邻 span 合并，不同 size 分开 -> 保留各自大小/位置
+                        merged = []
+                        for sp in spans:
+                            txt = "".join(ch.get("c", "") for ch in sp.get("chars", [])).strip()
+                            if not txt:
+                                continue
+                            sz = round(sp.get("size", 0), 1)
+                            if merged and merged[-1][0] == sz and abs(merged[-1][3] - (sp.get("bbox") or [0,0,0,0])[1]) < 2:
+                                merged[-1][1] += txt
+                                b0 = merged[-1][2]
+                                b1 = sp.get("bbox") or [0, 0, 0, 0]
+                                merged[-1][2] = (min(b0[0], b1[0]), min(b0[1], b1[1]),
+                                                 max(b0[2], b1[2]), max(b0[3], b1[3]))
+                            else:
+                                b = sp.get("bbox") or (0, 0, 0, 0)
+                                merged.append([sz, txt, tuple(round(v, 1) for v in b), (b[1] if isinstance(b, (list, tuple)) else 0)])
+                        for sz, content, bbox, _y0 in merged:
+                            if len(content) <= 1:
+                                continue
+                            size = sz
                             origin = None
                             rot = 0.0
+                            color = None
                             for sp in spans:
                                 chs = sp.get("chars") or []
                                 if chs and chs[0].get("origin"):
@@ -261,11 +277,13 @@ def analyze_chunk_worker(file_path, page_indices):
                                 if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
                                     o0, o1 = chs[0]["origin"], chs[1]["origin"]
                                     rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
+                                if sp.get('color'):
+                                    color = sp['color']
                                 if origin is not None:
                                     break
                             page_data['texts'].append({'text': content, 'bbox': bbox,
                                                        'size': size, 'origin': origin,
-                                                       'rot': rot})
+                                                       'rot': rot, 'color': color})
                 results.append(page_data)
             except Exception as e:
                 errors.append(f"Page {i} general error: {str(e)}")
@@ -523,7 +541,7 @@ class EnhancedWatermarkDialog(QDialog):
         self.setWindowTitle(self.t["dialog_title"])
         self.doc = doc
         self.scale = scale
-        self.img_boxes = {}; self.text_line_boxes = []; self.text_cards = []
+        self.img_boxes = {}; self.text_line_boxes = []; self.text_cards = []; self._img_frames = []
         
         available_geom = QApplication.primaryScreen().availableGeometry()
         self.resize(int(available_geom.width() * 0.95), int(available_geom.height() * 0.85))
@@ -570,7 +588,13 @@ class EnhancedWatermarkDialog(QDialog):
                             pass
                     qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                     lab = QLabel()
+                    lab._hi = qimg.copy()  # 原始高清(供悬停放大)
                     lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    # 极浅(白)图片水印 -> 灰底便于看清
+                    if pix.n and pix.width:
+                        _lum = sum(pix.samples[::pix.n]) / float(max(1, len(pix.samples) // pix.n))
+                        if _lum >= 235:
+                            lab.setStyleSheet("background:#808080;")
                 except Exception as e:
                     # 预览失败也要保留可勾选条目，避免候选静默消失
                     print(f"Error loading img preview: {e}")
@@ -582,6 +606,7 @@ class EnhancedWatermarkDialog(QDialog):
                 l.addWidget(lab); l.addStretch()
                 l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
                 self.scroll_layout.addWidget(frame)
+                self._img_frames.append(frame)
 
         if text_blocks:
             header_txt = QLabel(f"<b>{self.t['txt_header']}</b>")
@@ -594,18 +619,18 @@ class EnhancedWatermarkDialog(QDialog):
                 cb = QCheckBox(); cb.setChecked(False)
                 row_layout.addWidget(cb)
                 try:
-                    sample_page = self.doc[info['sample_page']]
-                    bbox = info.get('bbox', (0, 0, 0, 0))
-                    clip_rect = fitz.Rect(bbox) + (-10, -5, 10, 5)
-                    # 降低预览图精度以加快速度
-                    pix = sample_page.get_pixmap(clip=clip_rect, matrix=fitz.Matrix(1.5, 1.5))
-                    qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                     img_lab = QLabel()
-                    img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    qimg = self._text_thumb(key[0], info.get("size", 10), info.get('color'), info.get('rot', 0.0))
+                    if qimg is not None:
+                        img_lab._hi = qimg.copy()  # 原始高清(供悬停放大)
+                        img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    else:
+                        img_lab.setText("\u26a0 no preview")
                     # 设置 type 为 txt
-                    img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": bbox, "type": "txt",
-                                                     "pages": info.get('pages', [info['sample_page']]),
-                                                     "text": key[0]})
+                    img_lab.setProperty("loc_info", {"page": info["sample_page"], "bbox": info.get("bbox", (0,0,0,0)), "type": "txt",
+                                                     "pages": info.get("pages", [info["sample_page"]]), "text": key[0],
+                                                     "size": info.get("size", 0), "color": info.get("color"),
+                                                     "rot": info.get("rot", 0.0)})
                     img_lab.installEventFilter(self)
                     row_layout.addWidget(img_lab)
                 except Exception as e:
@@ -613,7 +638,8 @@ class EnhancedWatermarkDialog(QDialog):
                 row_layout.addStretch()
                 row_layout.addWidget(QLabel(f"<span style='{TXT_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
                 self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': info.get('bbox', (0, 0, 0, 0)), 'size': key[1],
-                                             'origin': info.get('origin'), 'rot': info.get('rot', 0.0)})
+                                             'origin': info.get('origin'), 'rot': info.get('rot', 0.0),
+                                             'origins': info.get('origins') or []})
                 self.text_cards.append((frame, key[0].lower()))
                 self.scroll_layout.addWidget(frame)
 
@@ -642,6 +668,14 @@ class EnhancedWatermarkDialog(QDialog):
         self._hover_type = "txt"
         self._hover_xref = None
         self._hover_text = None
+        self._hover_size = 0
+        self._hover_color = None
+        self._hover_rot = None
+        self._zoom_pop = QLabel("")
+        self._zoom_pop.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self._zoom_pop.setStyleSheet("background:#ffffff; border:1px solid #888; padding:2px;")
+        self._zoom_pop.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._zoom_pop.hide()
 
     def eventFilter(self, source, event):
         et = event.type()
@@ -658,8 +692,12 @@ class EnhancedWatermarkDialog(QDialog):
                 self._hover_type = loc["type"]
                 self._hover_xref = loc.get("xref")
                 self._hover_text = loc.get("text")
+                self._hover_size = loc.get("size") or 0
+                self._hover_color = loc.get("color")
+                self._hover_rot = loc.get("rot")
                 self.show_location_on_page(loc["page"], loc["bbox"], loc["type"])
                 self._update_hover_hint()
+                self._show_zoom(source)
             return True
         # 悬停候选后，滚轮在"该候选出现的各页"间切换预览
         if et == QEvent.Type.Wheel and source is self.location_preview and len(self._hover_pages) > 1:
@@ -668,44 +706,87 @@ class EnhancedWatermarkDialog(QDialog):
             self._hover_pos = (self._hover_pos + (-1 if delta > 0 else 1)) % n
             pg = self._hover_pages[self._hover_pos]
             located = self._locate_bbox(pg)
-            bbox = self._marker_rect(located)
-            self.show_location_on_page(pg, bbox, self._hover_type)
+            bboxes = self._marker_rects(located)
+            self.show_location_on_page(pg, bboxes, self._hover_type)
             self._update_hover_hint()
             event.accept()
+            return True
+        if et == QEvent.Type.Leave:
+            self._hide_zoom()
             return True
         return super().eventFilter(source, event)
 
     def _locate_bbox(self, page_idx):
-        """在指定页上重新定位当前悬停候选的实际位置（滚轮翻页后蓝圈跟随）。"""
+        """返回当前候选在指定页的所有实例 bbox 列表。
+        判定规则与候选一致：文本(允许同属性span拼接) + 字号 + 颜色 + 角度 全部匹配才圈。"""
         try:
             page = self.doc[page_idx]
             if self._hover_type == "img" and self._hover_xref:
                 rects = page.get_image_rects(self._hover_xref)
                 if rects:
-                    r = rects[0]
-                    return (r.x0, r.y0, r.x1, r.y1)
+                    return [(r.x0, r.y0, r.x1, r.y1) for r in rects]
             elif self._hover_type == "txt" and self._hover_text:
-                hits = page.search_for(self._hover_text)
-                if hits:
-                    q = hits[0]
-                    r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
-                    return (r.x0, r.y0, r.x1, r.y1)
+                want_size = self._hover_size or 0
+                want_color = self._hover_color
+                want_rot = self._hover_rot
+                out = []
+                blocks = page.get_text("rawdict")["blocks"]
+                for b in blocks:
+                    if b["type"] != 0:
+                        continue
+                    for line in b["lines"]:
+                        # 同 size/color 相邻 span 拼成一行文本（与采集端一致）
+                        segs = []
+                        for sp in line["spans"]:
+                            txt = "".join(ch.get("c", "") for ch in sp.get("chars", []))
+                            if txt == "":
+                                continue
+                            sz = round(sp.get("size", 0) or 0, 1)
+                            col = sp.get("color")
+                            if segs and segs[-1][0] == sz and segs[-1][2] == col:
+                                segs[-1][1] += txt
+                                bb0 = segs[-1][3]
+                                bb1 = sp.get("bbox") or (0, 0, 0, 0)
+                                segs[-1][3] = (min(bb0[0], bb1[0]), min(bb0[1], bb1[1]),
+                                               max(bb0[2], bb1[2]), max(bb0[3], bb1[3]))
+                            else:
+                                bb = sp.get("bbox") or (0, 0, 0, 0)
+                                segs.append([sz, txt, col, tuple(bb)])
+                        for sz, txt, col, bb in segs:
+                            txt = txt.replace(" ", "").strip()  # 与采集端一致：去空格
+                            if txt != self._hover_text.replace(" ", "").strip():
+                                continue
+                            if want_size and abs(sz - want_size) > max(2.0, want_size * 0.25):
+                                continue  # 字号不匹配不圈
+                            if want_color is not None and col != want_color:
+                                continue  # 颜色不匹配不圈
+                            # 角度校验：用前两字符原点算基线角
+                            rot = 0.0
+                            chs = [ch for sp in line["spans"] for ch in sp.get("chars", [])]
+                            if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
+                                o0, o1 = chs[0]["origin"], chs[1]["origin"]
+                                rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
+                            if want_rot is not None and abs(rot - want_rot) > 3.0:
+                                continue  # 角度不匹配不圈
+                            out.append((bb[0], bb[1], bb[2], bb[3]))
+                return out  # 无匹配 -> 空列表(不画圈)
         except Exception:
             pass
-        return self._hover_bbox
-
-    def _marker_rect(self, located):
-        """保持标记圈尺寸 = 样本(第一页)尺寸，只移动位置到当前页候选中心。"""
+        return [self._hover_bbox]
+    def _marker_rects(self, located_list):
+        """对每个实例 bbox 生成固定尺寸圈(尺寸=样本候选尺寸)。"""
         try:
             sb = self._hover_bbox or (0, 0, 0, 0)
             w = sb[2] - sb[0]
             h = sb[3] - sb[1]
-            cx = (located[0] + located[2]) / 2
-            cy = (located[1] + located[3]) / 2
-            return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+            out = []
+            for located in located_list:
+                cx = (located[0] + located[2]) / 2
+                cy = (located[1] + located[3]) / 2
+                out.append((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
+            return out
         except Exception:
-            return located
-
+            return located_list
     def _update_hover_hint(self):
         if len(self._hover_pages) > 1:
             self.hover_hint.setText(
@@ -713,45 +794,167 @@ class EnhancedWatermarkDialog(QDialog):
         else:
             self.hover_hint.setText("")
 
-    def show_location_on_page(self, page_idx, bbox, mark_type):
+    def show_location_on_page(self, page_idx, bboxes, mark_type):
+        """渲染页面并给所有匹配实例画圈。bboxes 可为单个 tuple 或列表。"""
         try:
             page = self.doc[page_idx]
+            if isinstance(bboxes, tuple):
+                bboxes = [bboxes]
             view_w, view_h = self.location_preview.width() - 20, self.location_preview.height() - 20
-            margin = 24  # 四周留白像素：让靠近/超出页面边缘的水印圆圈完整可见
-            # 算 zoom 时预留留白，使 "页 + 2*留白" 正好放进预览框，无需再缩放
+            margin = 24
             zoom = min((view_w - 2 * margin) / page.rect.width,
                        (view_h - 2 * margin) / page.rect.height)
             zoom = max(0.05, zoom)
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
             page_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-
-            # 用 Qt 把整页贴到带留白的画布上，圈画进留白不被裁
             canvas = QPixmap(pix.width + 2 * margin, pix.height + 2 * margin)
             canvas.fill(Qt.GlobalColor.white)
             painter = QPainter(canvas)
             painter.drawImage(margin, margin, page_img)
-            # 根据类型设置颜色：图片为红，文字为蓝
             color = QColor(231, 76, 60) if mark_type == "img" else QColor(52, 152, 219)
             painter.setPen(QPen(color, 2, Qt.PenStyle.SolidLine))
-            target = fitz.Rect(bbox)
-            x0 = target.x0 * zoom + margin
-            y0 = target.y0 * zoom + margin
-            x1 = target.x1 * zoom + margin
-            y1 = target.y1 * zoom + margin
-            padding = 6  # 椭圆比实际内容多出的边距
-            er = QRect(int(x0 - padding), int(y0 - padding),
-                       int((x1 - x0) + 2 * padding), int((y1 - y0) + 2 * padding))
-            painter.drawEllipse(er)
+            padding = 6
+            for bbox in bboxes:
+                target = fitz.Rect(bbox)
+                x0 = target.x0 * zoom + margin
+                y0 = target.y0 * zoom + margin
+                x1 = target.x1 * zoom + margin
+                y1 = target.y1 * zoom + margin
+                er = QRect(int(x0 - padding), int(y0 - padding),
+                           int((x1 - x0) + 2 * padding), int((y1 - y0) + 2 * padding))
+                painter.drawEllipse(er)
             painter.end()
-            # 画布已按预留留白计算尺寸，应正好适配；兜底防止仍超出
             pw, ph = self.location_preview.width() - 20, self.location_preview.height() - 20
             if canvas.width() > pw or canvas.height() > ph:
-                canvas = canvas.scaled(pw, ph,
-                                       Qt.AspectRatioMode.KeepAspectRatio,
-                                       Qt.TransformationMode.SmoothTransformation)
+                canvas = canvas.scaled(pw, ph, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
             self.location_preview.setPixmap(canvas)
         except Exception as e:
-            self.location_preview.setText(f"Preview error: {e}")
+            self.location_preview.setText(f"Preview error: 742")
+    def _crop_content(self, q, pad=8):
+        """把 QImage 内容(非白)紧贴裁边, 去掉四周空白; 失败返回原图。"""
+        try:
+            w, h = q.width(), q.height()
+            minx=miny=10**9; maxx=maxy=-1
+            for y in range(0, h, 2):
+                for x in range(0, w, 2):
+                    c = q.pixel(x, y)
+                    r=(c>>16)&255; g=(c>>8)&255; b=c&255
+                    if r<240 or g<240 or b<240:
+                        if x<minx:minx=x
+                        if x>maxx:maxx=x
+                        if y<miny:miny=y
+                        if y>maxy:maxy=y
+            if maxx < 0:
+                return q
+            x0=max(0,minx-pad); y0=max(0,miny-pad)
+            x1=min(w,maxx+pad); y1=min(h,maxy+pad)
+            return q.copy(x0, y0, x1-x0, y1-y0)
+        except Exception:
+            return q
+
+    def _text_thumb(self, text, size, color=None, rot=0.0):
+        """把候选文字单独渲染(保留旋转角度；白底/浅色水印把背景转浅灰)。
+        旋转在 Qt 侧用 QPixmap.transformed 完成——自动扩展画布，不会裁剪。"""
+        try:
+            import fitz as _f
+            size = max(8.0, float(size or 10))
+            n = max(1, len(text))
+            w = int(n * size * 1.25) + 120  # 宽度多留，左右都有空间
+            h = int(size * 3.2) + 40  # 高度多留，避免 fitz 渲染时底部/顶部被页面裁掉
+            ink = (0.0, 0.0, 0.0)
+            gray_bg = False
+            if isinstance(color, int):
+                lum = 0.299 * ((color >> 16) & 255) + 0.587 * ((color >> 8) & 255) + 0.114 * (color & 255)
+                if lum >= 200:  # 偏白水印 -> 浅色字 + 灰底，否则看不清
+                    gray_bg = True
+                    ink = (((color >> 16) & 255) / 255.0, ((color >> 8) & 255) / 255.0, (color & 255) / 255.0)
+            td = _f.open()
+            pg = td.new_page(width=max(50, w), height=max(40, h))
+            # 精确居中：水平按文本估算宽度居中，垂直按行高中点
+            tw = n * size * 1.05  # 文本近似宽度
+            x0 = max(20.0, (pg.rect.width - tw) / 2)
+            y0 = pg.rect.height / 2 + size * 0.35
+            pg.insert_text(_f.Point(x0, y0), text, fontsize=size,
+                           fontname="china-s", color=ink)
+            pix = pg.get_pixmap(matrix=_f.Matrix(1.5, 1.5))
+            q = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            td.close()
+            rot = float(rot or 0.0)
+            if abs(rot) > 0.5:
+                # 手动旋转：内容居中绘制到扩展画布，保证任何角度都不被裁
+                pm = QPixmap.fromImage(q)
+                tr = QTransform().rotate(rot)
+                br = tr.mapRect(QRectF(0, 0, pm.width(), pm.height()))
+                pad = 40  # 大留白：旋转后内容绝不会触边
+                out = QPixmap(int(br.width()) + 2 * pad, int(br.height()) + 2 * pad)
+                out.fill(Qt.GlobalColor.white)
+                p = QPainter(out)
+                p.translate(out.width() / 2, out.height() / 2)
+                p.rotate(rot)
+                p.drawPixmap(-pm.width() // 2, -pm.height() // 2, pm)
+                p.end()
+                q = out.toImage()
+                # 旋转后裁边：清掉旋转产生的空白；留足 padding 避免边缘字母被裁
+                q = self._crop_content(q, pad=70)
+            if gray_bg:
+                # 快速：半透明深灰遮罩叠加，背景变灰、浅色字仍可见（一次性合成，非逐像素）
+                q = q.convertToFormat(QImage.Format.Format_ARGB32)
+                ov = QPixmap(q.size())
+                ov.fill(Qt.GlobalColor.transparent)
+                p = QPainter(ov)
+                p.drawImage(0, 0, q)
+                p.fillRect(ov.rect(), QColor(90, 90, 90, 110))  # 半透明灰
+                p.end()
+                q = ov.toImage().convertToFormat(QImage.Format.Format_RGB888)
+            # 内容裁边：去掉四周空白，让水印占满；留 padding 防边缘字母被裁
+            q = self._crop_content(q, pad=48)
+            return q
+        except Exception:
+            return None
+
+    def _show_zoom(self, source):
+        """悬停小预览时，在旁边弹一个放大图（不拦截鼠标, 避开小图区域防闪烁）。
+        尺寸以屏幕可用区域为上限，避免放大图超出屏幕。"""
+        hi = getattr(source, '_hi', None)
+        src_img = hi if (hi is not None and not hi.isNull()) else None
+        pm = QPixmap.fromImage(src_img) if src_img is not None else source.pixmap()
+        if pm is None or pm.isNull():
+            return
+        from PyQt6.QtGui import QCursor
+        c = QCursor.pos()
+        # 用鼠标所在屏幕(多屏正确)，availableGeometry 已排除任务栏
+        scr = QApplication.screenAt(c).availableGeometry() if QApplication.screenAt(c) else \
+              QApplication.primaryScreen().availableGeometry()
+        max_w = int(scr.width() * 0.6)    # 最多占 60% 可用屏宽
+        max_h = int(scr.height() * 0.75)  # 最多占 75% 可用屏高(留边避免贴任务栏)
+        # 期望宽度 340；但不超过 max_w/max_h，也不缩小原图
+        target_w = min(340, max_w)
+        factor = max(1.0, target_w / max(1, pm.width()))
+        # 高度超限则按高度再收
+        if pm.height() * factor > max_h:
+            factor = min(factor, max_h / max(1, pm.height()))
+        big = pm.scaled(int(pm.width() * factor), int(pm.height() * factor),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+        # 最终兜底：仍超屏则压到屏内
+        if big.width() > max_w or big.height() > max_h:
+            big = big.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        self._zoom_pop.setPixmap(big)
+        self._zoom_pop.adjustSize()
+        # 优先放在鼠标上方; 若放不下(会盖住小图)则放下方
+        x = c.x() + 16
+        y = c.y() - self._zoom_pop.height() - 12
+        if y < scr.top() or (c.y() - 4 <= y + self._zoom_pop.height() <= c.y() + 4):
+            y = c.y() + 20  # 下方
+        x = max(scr.left(), min(x, scr.right() - self._zoom_pop.width()))
+        y = max(scr.top(), min(y, scr.bottom() - self._zoom_pop.height()))
+        self._zoom_pop.move(x, y)
+        self._zoom_pop.show()
+        self._zoom_pop.raise_()
+    def _hide_zoom(self):
+        self._zoom_pop.hide()
 
     def select_all(self):
         for cb in self.img_boxes.values(): cb.setChecked(True)
@@ -760,15 +963,19 @@ class EnhancedWatermarkDialog(QDialog):
         for cb in self.img_boxes.values(): cb.setChecked(False)
         for item in self.text_line_boxes: item['checkbox'].setChecked(False)
     def filter_items(self, text):
-        # 忽略所有空白（中文/IME 输入可能带空格或全角空格）
+
+        # 忽略所有空白；输入后连图片行一起隐藏
         q = "".join(text.lower().split())
+        for f in self._img_frames:
+            f.setVisible(q == "")
         for frame, content in self.text_cards:
             c = "".join(content.split())
             frame.setVisible(q in c)
     def get_selection(self):
         imgs = [h for h, cb in self.img_boxes.items() if cb.isChecked()]
         txts = [{'text': i['content'], 'bbox': i['bbox'], 'size': i['size'],
-                 'origin': i.get('origin'), 'rot': i.get('rot', 0.0)}
+                 'origin': i.get('origin'), 'rot': i.get('rot', 0.0),
+                 'origins': i.get('origins') or []}
                 for i in self.text_line_boxes if i['checkbox'].isChecked()]
         return imgs, txts
 
@@ -875,14 +1082,19 @@ class MasterWorker(QThread):
                                                            'sample_page': p['index'],
                                                            'sample_bbox': tuple(img_rect)}
                 for t in p['texts']:
-                    tk = (t['text'], t['size'], size_key)
+                    # 尺寸+颜色+角度 严格一致才算同一候选；角度归一到最近 5°(避免 0.2° 舍入拆开)
+                    rot_k = round(round(t.get('rot', 0.0) / 5.0) * 5.0, 1)
+                    tk = (t['text'], t['size'], t.get('color'), rot_k, size_key)
                     pages_by_tk.setdefault(tk, []).append(p['index'])
                     txt_counts[tk] = txt_counts.get(tk, 0) + 1
                     if tk not in final_txt_candidates:
                         final_txt_candidates[tk] = {'sample_page': p['index'], 'count': 0,
                                                     'bbox': t['bbox'],
                                                     'origin': t.get('origin'),
-                                                    'rot': t.get('rot', 0.0)}
+                                                    'rot': t.get('rot', 0.0), 'color': t.get('color'),
+                                                    'origins': []}
+                    if t.get('origin'):
+                        final_txt_candidates[tk]['origins'].append(t['origin'])
             for h, count in img_counts.items():
                 if count >= threshold:
                     final_img_candidates[h]['count'] += count
@@ -951,16 +1163,49 @@ class MasterWorker(QThread):
             self.progress.emit(30 + int((i + 1) / total * 30))
         # 几何签名删除（CID/特殊编码字体水印的关键词兜底）
         geo_removed = 0
-        geo_targets = []
+        # 优先用 PyMuPDF 内容定位精确实例（可解码 CID），再按每页精确位置删除
+        try:
+            import fitz as _lf
+        except ImportError:
+            import pymupdf as _lf
+        located = {}   # pno -> [(size, rot, cx, cy), ...]
         for c in tc:
-            if c.get('origin') and c.get('size'):
-                geo_targets.append((float(c['size']), float(c.get('rot', 0.0)),
-                                    float(c['origin'][0]), float(c['origin'][1])))
-        if geo_targets:
-            for page in pdf.pages:
+            if not c.get('text'):
+                continue
+            size = c.get('size')
+            try:
+                inst = _dw.locate_text_instances(fpath, c['text'], size,
+                                                 None, range(total))
+            except Exception:
+                inst = {}
+            for pno, boxes in inst.items():
+                for (x0, y0, x1, y1) in boxes:
+                    located.setdefault(pno, []).append(
+                        (float(size or 10), float(c.get('rot', 0.0)),
+                         x0, (y0 + y1) / 2))
+        # 补充：没有内容定位结果的候选，用 origins 兜底
+        geo_targets = []
+        if located:
+            # 按页处理：每页用该页定位到的精确位置
+            for page_idx, page in enumerate(pdf.pages):
                 if self.stop_flag:
                     break
-                geo_removed += _dw.process_page_geo(pdf, page, geo_targets)
+                if page_idx in located:
+                    geo_removed += _dw.process_page_geo(pdf, page, located[page_idx])
+        else:
+            for c in tc:
+                if not c.get('size'):
+                    continue
+                origins = c.get('origins') or ([c['origin']] if c.get('origin') else [])
+                for o in origins:
+                    if o:
+                        geo_targets.append((float(c['size']), float(c.get('rot', 0.0)),
+                                            float(o[0]), float(o[1])))
+            if geo_targets:
+                for page in pdf.pages:
+                    if self.stop_flag:
+                        break
+                    geo_removed += _dw.process_page_geo(pdf, page, geo_targets)
         img_removed = 0
         if confirmed_xrefs:
             img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
@@ -1449,6 +1694,10 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     apply_dark_mode(app, None)
     window = UltraAppFinal()
+    # 拖拽 PDF 到 exe 图标自动打开：接收命令行第一个参数
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]) and sys.argv[1].lower().endswith('.pdf'):
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(150, lambda p=sys.argv[1]: window.load_pdf(p))
     # 重型库后台延迟加载，窗口先出现
     import threading
     threading.Thread(target=_load_heavy_libs, daemon=True).start()
