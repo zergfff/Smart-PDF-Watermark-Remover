@@ -62,25 +62,46 @@ python batch_clean.py   # 自动识别 原始/ 里每份 PDF 的水印字符串 
 ## 🧪 真实案例
 
 `29-11-67 Rev3.pdf`（104 页，A4）：每页同一位置以约 52° 斜向绘制
-`C2 - Confidential - Downloaded by: Liu Changfa on 07-Jan-2026 for the exclusive use of Sichuan Airlines under SLS Terms & Conditions`，
-并带 AES-128（R=4）加密与权限限制（P=-60，禁止打印/复制等）。
+"`C2 - Confidential - Downloaded by: Liu Changfa on 07-Jan-2026 for the
+exclusive use of Sichuan Airlines under SLS Terms & Conditions`"，并带 AES-128（R=4）加密
+与权限限制（P=-60，禁止打印/复制等）。清理结果：104 页水印全部清除、残留 0 页、
+加密字典与权限位完全移除、正文像素级零损伤（差异 1.6% 仅在水印斜带）。
 
-清理结果：
-- ✅ 104 页水印全部清除，残留 0 页
-- ✅ 加密字典与权限位完全移除
-- ✅ 正文像素级零损伤：抽查 4 页渲染对比，差异像素仅约 1.6%，且差异区域恰好是水印斜带
+`HST85-2024.pdf`（16 页，中文 CID 字体水印"以正式出版文本为准"，包在旋转 35° 的
+Form XObject 里）：几何签名删除 16 页全清、残留 0/16、正文零损伤。
 
-## 📦 打包 EXE（可选）
+---
+
+## 🤖 Agent（AI 助手）调用方式
+
+本工具可直接被 AI Agent（Hermes / Claude Code / Codex / Cursor 等）驱动，
+形成「软件找水印 → 编号 → 你确认号 → Agent 删除」的人机闭环：
 
 ```bash
-pip install pyinstaller
-# 单文件版（方便分享，启动需解压，约 3s）
-pyinstaller -w -F main.py --name Extreme_PDF_Cleaner
-# 目录版（启动最快 ~0.3s，exe 与 _internal 目录需放一起）
-pyinstaller -w main.py --name Extreme_PDF_Cleaner
+# 1) 列出疑似水印并编号（带每个候选的「去除前/去除后」对比预览图）
+python dewatermark_agent.py list 文件.pdf --before-after-dir ./ba
+#   输出形如：
+#   [1] TEXT  '以正式出版文本为准'  (36.0pt, 16页, bbox=..., 旋转-35.0°)
+#   [3] IMAGE xref=262 (26页, bbox=...)
+#   并生成 01_before.png / 01_after.png ...（同一区域 前/后 对比，供看图确认）
+
+# 2) 按编号删除（只删该候选，自动复检）
+python dewatermark_agent.py remove 文件.pdf --select 1,3
+#   --select all  删除全部候选
 ```
 
-> 💡 **启动速度**：想要秒开请用**目录版**（免解压）；单文件版适合单个分享但每次启动要解压 70MB。GitHub Release 同时附带单文件版与目录版 zip。
+**推荐 Agent 工作流：**
+1. Agent 运行 `dewatermark_agent.py list <pdf> --before-after-dir ./ba`
+2. Agent 读出编号候选 + 每张「前/后」对比图，贴给用户并配文，如：
+   `候选 #1（水印：斜体大字"以正式出版文本为准"）—— 前/后对比`
+3. 用户看图报号（如`3 号`）
+4. Agent 运行 `remove 文件.pdf --select 3`，自动删除并复检，把结果 PDF 交付用户
+
+> 对 Agent 的提示：
+> - `list --json` 输出机器可读候选列表（含 id/kind/text/size/bbox/origin/rot/count/pages/xref），便于程序化解析
+> - `list --previews-dir` 只出候选区域截图（不跑删除）；`--before-after-dir` 额外生成「前/后」对比
+> - 文本水印按「关键词 + 几何(字号/旋转/起点)」删除、图片水印按 xref 删除，
+>   内置 CID/中文乱码字体水印处理，绝大多数 PDF 无需额外传参
 
 ## 依赖
 

@@ -43,9 +43,11 @@ jobs:
           path: |
             dist/*.exe
             Extreme_PDF_Cleaner_Portable.zip
+            pdf_dewatermark.py
             batch_clean.py
             verify_clean.py
             pixel_check.py
+            dewatermark_agent.py
           if-no-files-found: error
 
       - name: Attach EXEs to GitHub Release (tag push only)
@@ -60,3 +62,4 @@ jobs:
             batch_clean.py
             verify_clean.py
             pixel_check.py
+            dewatermark_agent.py
