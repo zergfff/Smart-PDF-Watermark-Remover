@@ -561,6 +561,104 @@ def locate_text_instances(path, text, size=None, rot=None, pages=None):
     return out
 
 
+def find_and_remove_form(pdf, path, text) -> int:
+    """用户勾选即删：候选文本在页面上存在但几何删除未命中时，
+    说明水印在 Form XObject 里 —— 删除所有页面上实际 Do 调用的 Form。
+    返回删除的 Do 数。"""
+    try:
+        import fitz as _f
+    except ImportError:
+        import pymupdf as _f
+    want = text.replace(" ", "").strip()
+    found_any = False
+    try:
+        doc = _f.open(path)
+        for pno in range(min(3, doc.page_count)):
+            for b in doc[pno].get_text("rawdict")["blocks"]:
+                if b["type"] != 0:
+                    continue
+                for line in b["lines"]:
+                    t = "".join(ch.get("c", "") for sp in line["spans"]
+                                for ch in sp.get("chars", [])).replace(" ", "").strip()
+                    if t == want:
+                        found_any = True
+                        break
+                if found_any:
+                    break
+            if found_any:
+                break
+        doc.close()
+    except Exception:
+        pass
+    if not found_any:
+        return 0
+    total = 0
+    for page in pdf.pages:
+        res = page.get("/Resources")
+        if res is None:
+            continue
+        xo = res.get("/XObject")
+        if xo is None:
+            continue
+        contents = page.Contents
+        if contents is None:
+            continue
+        streams = contents if isinstance(contents, pikepdf.Array) else [contents]
+        page_do_forms = set()
+        for s in streams:
+            if s is None:
+                continue
+            data = s.read_bytes()
+            for m in re.finditer(rb"/([A-Za-z0-9.]+)[ \t\r\n]*Do\b", data):
+                page_do_forms.add(m.group(1).decode("latin-1"))
+        for fname in page_do_forms:
+            key = "/" + fname
+            if key in xo:
+                try:
+                    if xo[key].get("/Subtype") == pikepdf.Name("/Form"):
+                        total += remove_form_instances(pdf, fname)
+                except Exception:
+                    continue
+    return total
+
+
+def remove_form_instances(pdf, form_name, do_substr=None) -> int:
+    """删除页面流中指定 Form 的 Do 调用（水印常被封装成独立 Form 每页 Do）。
+    form_name: XObject 资源名（如 'Fm0'）。返回删除的 Do 数。"""
+    total = 0
+    for page in pdf.pages:
+        res = page.get("/Resources")
+        if res is None:
+            continue
+        xo = res.get("/XObject")
+        if xo is None:
+            continue
+        # 确认该 Form 存在
+        fname = form_name if form_name.startswith("/") else "/" + form_name
+        obj = xo.get(fname)
+        if obj is None:
+            continue
+        contents = page.Contents
+        if contents is None:
+            continue
+        streams = contents if isinstance(contents, pikepdf.Array) else [contents]
+        for s in streams:
+            if s is None:
+                continue
+            data = s.read_bytes()
+            nm_b = form_name.encode("latin-1")
+            pat = re.compile(rb"/" + re.escape(nm_b) +
+                             rb"(?![A-Za-z0-9])[ \t\r\n]*Do\b")
+            new_data, k = pat.subn(b"", data)
+            if k:
+                s.write(new_data)
+                total += k
+        # 移除资源项
+        if fname in xo:
+            del xo[fname]
+    return total
+
+
 def process_page_geo(pdf, page, geo_targets) -> int:
     """按几何签名删除页面上匹配的水印文本块（含 Form 容器），返回删除块数。
     geo_targets 使用 fitz 坐标（y 向下）；这里按页高转换到 PDF 坐标（y 向上）。"""
@@ -906,7 +1004,7 @@ def remove_image_watermarks(pdf, cand) -> int:
                 for nm in names:
                     nm_b = nm.lstrip('/').encode('latin-1')
                     pat = re.compile(rb'/' + re.escape(nm_b) +
-                                     rb'(?![A-Za-z0-9])[ \t\r\n]*Do\b')
+                             rb"(?![A-Za-z0-9])[ \t\r\n]*Do\b")
                     new_data, k = pat.subn(b'', new_data)
                     total += k
                 if new_data != data:

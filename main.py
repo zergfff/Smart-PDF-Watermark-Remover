@@ -1206,6 +1206,17 @@ class MasterWorker(QThread):
                     if self.stop_flag:
                         break
                     geo_removed += _dw.process_page_geo(pdf, page, geo_targets)
+        # Form 兜底：用户勾选即删 —— 候选 locate 命中但几何删除未生效时,
+        # 水印在 Form 里, 直接删该文本所在 Form 的 Do
+        form_removed = 0
+        if geo_removed == 0 and located:
+            for c in tc:
+                if not c.get('text'):
+                    continue
+                try:
+                    form_removed += _dw.find_and_remove_form(pdf, fpath, c['text'])
+                except Exception:
+                    pass
         img_removed = 0
         if confirmed_xrefs:
             img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
