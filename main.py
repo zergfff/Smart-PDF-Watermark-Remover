@@ -576,7 +576,8 @@ class EnhancedWatermarkDialog(QDialog):
                     print(f"Error loading img preview: {e}")
                     lab = QLabel("⚠ preview failed")
                 lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": info['sample_bbox'], "type": "img",
-                                             "pages": info.get('pages', [info['sample_page']])})
+                                             "pages": info.get('pages', [info['sample_page']]),
+                                             "xref": info.get('xref')})
                 lab.installEventFilter(self)
                 l.addWidget(lab); l.addStretch()
                 l.addWidget(QLabel(f"<span style='{IMG_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
@@ -603,7 +604,8 @@ class EnhancedWatermarkDialog(QDialog):
                     img_lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(220*scale), int(60*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
                     # 设置 type 为 txt
                     img_lab.setProperty("loc_info", {"page": info['sample_page'], "bbox": bbox, "type": "txt",
-                                                     "pages": info.get('pages', [info['sample_page']])})
+                                                     "pages": info.get('pages', [info['sample_page']]),
+                                                     "text": key[0]})
                     img_lab.installEventFilter(self)
                     row_layout.addWidget(img_lab)
                 except Exception as e:
@@ -638,6 +640,8 @@ class EnhancedWatermarkDialog(QDialog):
         self._hover_pos = 0
         self._hover_bbox = None
         self._hover_type = "txt"
+        self._hover_xref = None
+        self._hover_text = None
 
     def eventFilter(self, source, event):
         et = event.type()
@@ -652,6 +656,8 @@ class EnhancedWatermarkDialog(QDialog):
                     self._hover_pos = 0
                 self._hover_bbox = loc["bbox"]
                 self._hover_type = loc["type"]
+                self._hover_xref = loc.get("xref")
+                self._hover_text = loc.get("text")
                 self.show_location_on_page(loc["page"], loc["bbox"], loc["type"])
                 self._update_hover_hint()
             return True
@@ -661,11 +667,44 @@ class EnhancedWatermarkDialog(QDialog):
             n = len(self._hover_pages)
             self._hover_pos = (self._hover_pos + (-1 if delta > 0 else 1)) % n
             pg = self._hover_pages[self._hover_pos]
-            self.show_location_on_page(pg, self._hover_bbox, self._hover_type)
+            located = self._locate_bbox(pg)
+            bbox = self._marker_rect(located)
+            self.show_location_on_page(pg, bbox, self._hover_type)
             self._update_hover_hint()
             event.accept()
             return True
         return super().eventFilter(source, event)
+
+    def _locate_bbox(self, page_idx):
+        """在指定页上重新定位当前悬停候选的实际位置（滚轮翻页后蓝圈跟随）。"""
+        try:
+            page = self.doc[page_idx]
+            if self._hover_type == "img" and self._hover_xref:
+                rects = page.get_image_rects(self._hover_xref)
+                if rects:
+                    r = rects[0]
+                    return (r.x0, r.y0, r.x1, r.y1)
+            elif self._hover_type == "txt" and self._hover_text:
+                hits = page.search_for(self._hover_text)
+                if hits:
+                    q = hits[0]
+                    r = q.rect if hasattr(q, "rect") else fitz.Rect(q)
+                    return (r.x0, r.y0, r.x1, r.y1)
+        except Exception:
+            pass
+        return self._hover_bbox
+
+    def _marker_rect(self, located):
+        """保持标记圈尺寸 = 样本(第一页)尺寸，只移动位置到当前页候选中心。"""
+        try:
+            sb = self._hover_bbox or (0, 0, 0, 0)
+            w = sb[2] - sb[0]
+            h = sb[3] - sb[1]
+            cx = (located[0] + located[2]) / 2
+            cy = (located[1] + located[3]) / 2
+            return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        except Exception:
+            return located
 
     def _update_hover_hint(self):
         if len(self._hover_pages) > 1:
@@ -678,27 +717,39 @@ class EnhancedWatermarkDialog(QDialog):
         try:
             page = self.doc[page_idx]
             view_w, view_h = self.location_preview.width() - 20, self.location_preview.height() - 20
-            zoom = min(view_w / page.rect.width, view_h / page.rect.height)
+            margin = 24  # 四周留白像素：让靠近/超出页面边缘的水印圆圈完整可见
+            # 算 zoom 时预留留白，使 "页 + 2*留白" 正好放进预览框，无需再缩放
+            zoom = min((view_w - 2 * margin) / page.rect.width,
+                       (view_h - 2 * margin) / page.rect.height)
+            zoom = max(0.05, zoom)
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            pixmap = QPixmap.fromImage(QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888))
-            
-            painter = QPainter(pixmap)
+            page_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+
+            # 用 Qt 把整页贴到带留白的画布上，圈画进留白不被裁
+            canvas = QPixmap(pix.width + 2 * margin, pix.height + 2 * margin)
+            canvas.fill(Qt.GlobalColor.white)
+            painter = QPainter(canvas)
+            painter.drawImage(margin, margin, page_img)
             # 根据类型设置颜色：图片为红，文字为蓝
             color = QColor(231, 76, 60) if mark_type == "img" else QColor(52, 152, 219)
             painter.setPen(QPen(color, 2, Qt.PenStyle.SolidLine))
-            
-            # 计算适配大小的椭圆 (尺寸大一圈)
-            target_rect = fitz.Rect(bbox) * zoom
-            padding = 6 # 椭圆比实际内容多出的边距
-            ellipse_rect = target_rect.irect # 获取整数矩形
-            ellipse_rect.x0 -= padding
-            ellipse_rect.y0 -= padding
-            ellipse_rect.x1 += padding
-            ellipse_rect.y1 += padding
-            
-            painter.drawEllipse(ellipse_rect.x0, ellipse_rect.y0, ellipse_rect.width, ellipse_rect.height)
+            target = fitz.Rect(bbox)
+            x0 = target.x0 * zoom + margin
+            y0 = target.y0 * zoom + margin
+            x1 = target.x1 * zoom + margin
+            y1 = target.y1 * zoom + margin
+            padding = 6  # 椭圆比实际内容多出的边距
+            er = QRect(int(x0 - padding), int(y0 - padding),
+                       int((x1 - x0) + 2 * padding), int((y1 - y0) + 2 * padding))
+            painter.drawEllipse(er)
             painter.end()
-            self.location_preview.setPixmap(pixmap)
+            # 画布已按预留留白计算尺寸，应正好适配；兜底防止仍超出
+            pw, ph = self.location_preview.width() - 20, self.location_preview.height() - 20
+            if canvas.width() > pw or canvas.height() > ph:
+                canvas = canvas.scaled(pw, ph,
+                                       Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+            self.location_preview.setPixmap(canvas)
         except Exception as e:
             self.location_preview.setText(f"Preview error: {e}")
 
