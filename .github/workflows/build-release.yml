@@ -38,6 +38,7 @@ jobs:
         run: |
           python -m PyInstaller -w --clean --distpath dist_dir --workpath build_on --name Extreme_PDF_Cleaner main.py
           python -c "import shutil; shutil.copy('dist/dewatermark_agent.exe', 'dist_dir/Extreme_PDF_Cleaner/')"
+          python -c "import shutil; shutil.copy('AGENTS.md', 'dist_dir/Extreme_PDF_Cleaner/AGENTS.md')"
           python -c "import shutil; shutil.make_archive('Extreme_PDF_Cleaner_Portable', 'zip', 'dist_dir', 'Extreme_PDF_Cleaner')"
 
       - name: Upload artifacts
