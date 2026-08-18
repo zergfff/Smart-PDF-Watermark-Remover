@@ -61,6 +61,4 @@ jobs:
           generate_release_notes: true
           files: |
             dist/dewatermark_agent.exe
-            dist/pdf_dewatermark.exe
             Extreme_PDF_Cleaner_Portable.zip
-            dewatermark_agent.py
