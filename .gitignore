@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 build/
+build_ag/
+build_on/
+build_agent/
 dist/
 *.spec
 .venv/

@@ -2,12 +2,17 @@
 
 一键清除 PDF 中反复出现的水印（文本 / 图片 / Logo），并移除文档加密与权限限制（禁止打印、复制等）。
 
+> ⬇️ **直接下载 `Extreme_PDF_Cleaner_Portable.zip`**（目录版，启动最快 ~0.3s）。
+> 解压后双击里面的 `Extreme_PDF_Cleaner.exe` 即用（exe 与 `_internal` 目录要放一起）；
+> 目录里还内置了 `dewatermark_agent.exe`，供 AI Agent 无 Python 驱动。
+
 提供两种用法：
 
 | 模式 | 入口 | 适用场景 |
 |---|---|---|
-| 🖥️ GUI 桌面版 | `python main.py` | 自动频率分析 + 交互勾选确认，日常手动清理 |
+| 🖥️ GUI 桌面版 | `python main.py`（或 Portable 包） | 自动频率分析 + 交互勾选确认，日常手动清理 |
 | 🔧 CLI 命令行版 | `python pdf_dewatermark.py` | 按关键词精确删除，适合批处理 / 脚本化 |
+| 🤖 Agent 调用 | `dewatermark_agent.py` / `dewatermark_agent.exe` | AI Agent 按编号找/删水印（见下方章节） |
 
 ## ✨ 功能特性
 
