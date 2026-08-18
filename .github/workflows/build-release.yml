@@ -28,12 +28,16 @@ jobs:
       - name: Build CLI (pdf_dewatermark.exe)
         run: python -m PyInstaller -F --clean --name pdf_dewatermark pdf_dewatermark.py
 
+      - name: Build Agent CLI (dewatermark_agent.exe)
+        run: python -m PyInstaller -F --clean --name dewatermark_agent dewatermark_agent.py
+
       - name: Build GUI onefile (Extreme_PDF_Cleaner.exe)
         run: python -m PyInstaller -F -w --clean --name Extreme_PDF_Cleaner main.py
 
-      - name: Build GUI onedir (fast startup) + zip
+      - name: Build GUI onedir (fast startup) + zip (含 agent exe)
         run: |
           python -m PyInstaller -w --clean --distpath dist_dir --workpath build_on --name Extreme_PDF_Cleaner main.py
+          python -c "import shutil; shutil.copy('dist/dewatermark_agent.exe', 'dist_dir/Extreme_PDF_Cleaner/')"
           python -c "import shutil; shutil.make_archive('Extreme_PDF_Cleaner_Portable', 'zip', 'dist_dir', 'Extreme_PDF_Cleaner')"
 
       - name: Upload artifacts
@@ -57,6 +61,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/pdf_dewatermark.exe
+            dist/dewatermark_agent.exe
             dist/Extreme_PDF_Cleaner.exe
             Extreme_PDF_Cleaner_Portable.zip
             batch_clean.py

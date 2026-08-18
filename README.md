@@ -77,6 +77,11 @@ Form XObject 里）：几何签名删除 16 页全清、残留 0/16、正文零�
 本工具可直接被 AI Agent（Hermes / Claude Code / Codex / Cursor 等）驱动，
 形成「软件找水印 → 编号 → 你确认号 → Agent 删除」的人机闭环：
 
+> 💡 **免安装 Python 也能用**：`Extreme_PDF_Cleaner_Portable.zip` 目录版里已内置
+> `dewatermark_agent.exe`（GUI 与 agent 一体）；Release 也单独提供 `dewatermark_agent.exe`。
+> 直接用 `dewatermark_agent.exe list/remove` 即可，无需装 Python。
+> 源码方式（需 Python + `pip install pymupdf pikepdf`）则用 `python dewatermark_agent.py`。
+
 ```bash
 # 1) 列出疑似水印并编号（带每个候选的「去除前/去除后」对比预览图）
 python dewatermark_agent.py list 文件.pdf --before-after-dir ./ba
