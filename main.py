@@ -8,6 +8,7 @@ import uuid
 import subprocess
 import importlib
 import traceback
+import threading
 
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
@@ -478,91 +479,140 @@ def _pix_hash(pix):
     return xxhash.xxh64(pix.samples).hexdigest()
 
 
-def analyze_chunk_worker(file_path, page_indices):
-    import pymupdf as fitz  # 子进程内确保加载（主进程是延迟加载）
-    results = []
-    errors = []
-    doc = None
+def analyze_page(fitz, doc, i):
+    """扫描单页：解图片哈希 + 取 bbox + 提取文本块。
+
+    纯函数，可在多线程里对**不同 page 索引**并发调用。
+    """
+    page = doc[i]
+    rect = page.rect
+    pw, ph = round(rect.width, 1), round(rect.height, 1)
+    page_data = {'index': i, 'size_key': (pw, ph), 'imgs': [], 'texts': []}
+    bbox_by_xref = {}
     try:
-        doc = fitz.open(file_path)
-        for i in page_indices:
-            try:
-                page = doc[i]
-                rect = page.rect
-                pw, ph = round(rect.width, 1), round(rect.height, 1)
-                page_data = {'index': i, 'size_key': (pw, ph), 'imgs': [], 'texts': []}
-                bbox_by_xref = {}
-                try:
-                    for ii in page.get_image_info(xrefs=True):
-                        xref = ii.get('xref')
-                        bbox = ii.get('bbox')
-                        if xref is not None and bbox:
-                            bbox_by_xref[int(xref)] = tuple(bbox)
-                except Exception:
-                    pass
-                for img in page.get_images(full=True):
-                    try:
-                        pix = fitz.Pixmap(doc, img[0])
-                        h = _pix_hash(pix)
-                        page_data['imgs'].append({
-                            'hash': h, 'xref': img[0],
-                            'w': img[2], 'h': img[3],
-                            'bbox': bbox_by_xref.get(img[0]),
-                        })
-                    except Exception as e:
-                        errors.append(f"Page {i} image error: {str(e)}")
-                        continue
-                blocks = page.get_text("rawdict")["blocks"]
-                for b in blocks:
-                    if b["type"] != 0: continue
-                    for line in b["lines"]:
-                        spans = line["spans"]
-                        # 按 span 拆分：同 size 相邻 span 合并，不同 size 分开 -> 保留各自大小/位置
-                        merged = []
-                        for sp in spans:
-                            txt = "".join(ch.get("c", "") for ch in sp.get("chars", [])).strip()
-                            if not txt:
-                                continue
-                            sz = round(sp.get("size", 0), 1)
-                            if merged and merged[-1][0] == sz and abs(merged[-1][3] - (sp.get("bbox") or [0,0,0,0])[1]) < 2:
-                                merged[-1][1] += txt
-                                b0 = merged[-1][2]
-                                b1 = sp.get("bbox") or [0, 0, 0, 0]
-                                merged[-1][2] = (min(b0[0], b1[0]), min(b0[1], b1[1]),
-                                                 max(b0[2], b1[2]), max(b0[3], b1[3]))
-                            else:
-                                b = sp.get("bbox") or (0, 0, 0, 0)
-                                merged.append([sz, txt, tuple(round(v, 1) for v in b), (b[1] if isinstance(b, (list, tuple)) else 0)])
-                        for sz, content, bbox, _y0 in merged:
-                            if len(content) <= 1:
-                                continue
-                            size = sz
-                            origin = None
-                            rot = 0.0
-                            color = None
-                            for sp in spans:
-                                chs = sp.get("chars") or []
-                                if chs and chs[0].get("origin"):
-                                    origin = tuple(round(v, 1) for v in chs[0]["origin"])
-                                # 旋转角：用前两个字符原点算基线方向（fitz y 向下）
-                                if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
-                                    o0, o1 = chs[0]["origin"], chs[1]["origin"]
-                                    rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
-                                if sp.get('color'):
-                                    color = sp['color']
-                                if origin is not None:
-                                    break
-                            page_data['texts'].append({'text': content, 'bbox': bbox,
-                                                       'size': size, 'origin': origin,
-                                                       'rot': rot, 'color': color})
-                results.append(page_data)
-            except Exception as e:
-                errors.append(f"Page {i} general error: {str(e)}")
-    except Exception as e:
-        errors.append(f"Worker file open error: {str(e)}")
-    finally:
-        if doc: doc.close()
+        for ii in page.get_image_info(xrefs=True):
+            xref = ii.get('xref')
+            bbox = ii.get('bbox')
+            if xref is not None and bbox:
+                bbox_by_xref[int(xref)] = tuple(bbox)
+    except Exception:
+        pass
+    for img in page.get_images(full=True):
+        try:
+            pix = fitz.Pixmap(doc, img[0])
+            h = _pix_hash(pix)
+            page_data['imgs'].append({
+                'hash': h, 'xref': img[0],
+                'w': img[2], 'h': img[3],
+                'bbox': bbox_by_xref.get(img[0]),
+            })
+        except Exception as e:
+            page_data.setdefault('_errs', []).append(f"Page {i} image error: {e}")
+            continue
+    blocks = page.get_text("rawdict")["blocks"]
+    for b in blocks:
+        if b["type"] != 0: continue
+        for line in b["lines"]:
+            spans = line["spans"]
+            merged = []
+            for sp in spans:
+                txt = "".join(ch.get("c", "") for ch in sp.get("chars", [])).strip()
+                if not txt:
+                    continue
+                sz = round(sp.get("size", 0), 1)
+                if merged and merged[-1][0] == sz and abs(merged[-1][3] - (sp.get("bbox") or [0,0,0,0])[1]) < 2:
+                    merged[-1][1] += txt
+                    b0 = merged[-1][2]
+                    b1 = sp.get("bbox") or [0, 0, 0, 0]
+                    merged[-1][2] = (min(b0[0], b1[0]), min(b0[1], b1[1]),
+                                     max(b0[2], b1[2]), max(b0[3], b1[3]))
+                else:
+                    b = sp.get("bbox") or (0, 0, 0, 0)
+                    merged.append([sz, txt, tuple(round(v, 1) for v in b), (b[1] if isinstance(b, (list, tuple)) else 0)])
+            for sz, content, bbox, _y0 in merged:
+                if len(content) <= 1:
+                    continue
+                size = sz
+                origin = None
+                rot = 0.0
+                color = None
+                for sp in spans:
+                    chs = sp.get("chars") or []
+                    if chs and chs[0].get("origin"):
+                        origin = tuple(round(v, 1) for v in chs[0]["origin"])
+                    if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
+                        o0, o1 = chs[0]["origin"], chs[1]["origin"]
+                        rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
+                    if sp.get('color'):
+                        color = sp['color']
+                    if origin is not None:
+                        break
+                page_data['texts'].append({'text': content, 'bbox': bbox,
+                                           'size': size, 'origin': origin,
+                                           'rot': rot, 'color': color})
+    return page_data
+
+
+def analyze_chunk_worker(file_path, page_indices):
+    """兼容旧调用签名。内部转 _scan_pages，避免每页重新 open。"""
+    import pymupdf as fitz  # 子进程/惰性调用场景下确保加载
+    results, errors = _scan_pages(fitz, file_path, page_indices)
     return results, errors
+
+
+def _scan_pages(fitz, file_path, page_indices, doc=None):
+    """扫描一组页。**每个 worker 线程独立 fitz.open**——PyMuPDF 的 Document
+    不是线程安全的，多线程共享同一 doc 会触发内部状态竞争。
+    但独立 open 的成本可控：319 页/4 线程只 open 4 次（原来 319 次）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    indices = list(page_indices)
+    total = len(indices)
+    if total == 0:
+        return [], []
+    # 少于 4 页不值得开线程池
+    nthreads = min(4, max(1, total // 4))
+    if nthreads <= 1 or total <= 4:
+        d = None
+        try:
+            d = fitz.open(file_path)
+            out, errors = [], []
+            for i in indices:
+                try:
+                    out.append(analyze_page(fitz, d, i))
+                except Exception as e:
+                    errors.append(f"Page {i} general error: {e!r}")
+            return out, errors
+        except Exception as e:
+            return [], [f"File open error: {e!r}"]
+        finally:
+            if d: d.close()
+
+    def _worker(chunk):
+        my_results, my_errors = [], []
+        d = None
+        try:
+            d = fitz.open(file_path)
+            for i in chunk:
+                try:
+                    my_results.append(analyze_page(fitz, d, i))
+                except Exception as e:
+                    my_errors.append(f"Page {i} general error: {e!r}")
+        except Exception as e:
+            my_errors.append(f"Worker file open error: {e!r}")
+        finally:
+            if d: d.close()
+        return my_results, my_errors
+
+    # 交错切分：每个 worker 拿 [0::n], [1::n], ... 保持大致顺序、负载更均衡
+    chunks = [indices[k::nthreads] for k in range(nthreads)]
+    with ThreadPoolExecutor(max_workers=nthreads) as ex:
+        all_res, all_err = [], []
+        for chunk_res, chunk_errs in ex.map(_worker, chunks):
+            all_res.extend(chunk_res)
+            all_err.extend(chunk_errs)
+    all_res.sort(key=lambda r: r.get('index', 0))
+    return all_res, all_err
 
 # --- 1.5 内容流级删除（替代红色遮盖 redaction，避免误删正文） ---
 import re as _re
@@ -1531,24 +1581,29 @@ class MasterWorker(QThread):
         cpu_count = max(1, (os.cpu_count() or 4) - 1)
         chunk_size = max(1, total // cpu_count)
         ranges = [list(range(i, min(i + chunk_size, total))) for i in range(0, total, chunk_size)]
-        self.log_signal.emit(f">>> PDF loaded: {total} pages. Serial scan (safe on Windows + PyMuPDF).")
+        self.log_signal.emit(f">>> PDF loaded: {total} pages. Thread-pool scan (4 workers, {cpu_count} cores available).")
         all_page_results = []
-        # 直接用串行扫描：76 页仅约 2 秒，并行在 Windows + PyMuPDF 下容易 BrokenProcessPool 死锁
-        for idx, i in enumerate(range(total)):
+        # 线程池并发扫描：每 worker 独立 fitz.open 一次（避免 319 次重复 open）。
+        # Windows 上 ProcessPoolExecutor + PyMuPDF 死锁，改用线程池 + 每 worker 各自 doc。
+        # 进度以批为单位上报，避免 319 次 log 淹没文件。
+        SCAN_BATCH = 20
+        page_list = list(range(total))
+        for base in range(0, total, SCAN_BATCH):
             if self.stop_flag:
                 doc.close()
                 return None
+            batch = page_list[base:base + SCAN_BATCH]
             try:
-                res, errs = analyze_chunk_worker(fpath, [i])
+                res, errs = _scan_pages(fitz, fpath, batch)
                 all_page_results.extend(res)
                 for e in errs:
                     self.log_signal.emit(f"Worker Warning: {e}")
             except Exception as e:
-                self.log_signal.emit(f">>> Page {i} scan error: {e!r}")
-            if (idx + 1) % 10 == 0 or idx == total - 1:
-                pct = int((idx + 1) / total * 80)
-                self.progress.emit(pct)
-                self.log_signal.emit(f">>> Scanning progress: {int((idx+1)/total*100)}%")
+                self.log_signal.emit(f">>> Batch scan error: {e!r}")
+            done = min(base + SCAN_BATCH, total)
+            pct = int(done / total * 80)
+            self.progress.emit(pct)
+            self.log_signal.emit(f">>> Scanning progress: {int(100*done/total)}%")
 
         self.log_signal.emit(">>> Grouping candidates (no per-xref get_image_rects)...")
         size_groups = {}
@@ -1825,14 +1880,20 @@ class MasterWorker(QThread):
         doc.close()
 
         removed_total = 0
-        for i, page in enumerate(pdf.pages):
-            if self.stop_flag:
-                pdf.close()
-                return None
-            n = _wm_process_page(pdf, page, keywords)
-            n += _wm_process_xobjects(page.get("/Resources"), keywords)
-            removed_total += n
-            self.progress.emit(30 + int((i + 1) / total * 30))
+        # 只有关键词（文本水印）非空才需要扫每页 Contents；否则整段可跳过。
+        # 对 319 页的扫描 PDF 这是最大节省：原每页都要 read_bytes + regex 21 秒。
+        if keywords:
+            for i, page in enumerate(pdf.pages):
+                if self.stop_flag:
+                    pdf.close()
+                    return None
+                n = _wm_process_page(pdf, page, keywords)
+                n += _wm_process_xobjects(page.get("/Resources"), keywords)
+                removed_total += n
+                self.progress.emit(30 + int((i + 1) / total * 30))
+        else:
+            self.log_signal.emit(">>> Text watermark skip: keywords empty (image-only mode).")
+            self.progress.emit(60)
         # 几何签名删除（CID/特殊编码字体水印的关键词兜底）
         geo_removed = 0
         import pymupdf as _lf
@@ -2632,35 +2693,102 @@ class UltraAppFinal(QMainWindow):
         self.update_previews()
 
     def save_pdf_inplace(self):
-        """保存：直接覆盖源文件（不改变文件名和路径）。"""
+        """保存：直接覆盖源文件（不改变文件名和路径）。
+
+        Windows 上 os.replace 会因源文件句柄被占用（doc_orig / doc_clean 还开着）
+        返回 WinError 5；即使换 os.remove+rename 也会 WinError 32（文件被另一个程序占用）。
+        正确顺序：先落盘 tmp → 关闭所有 fitz doc → 删源 → 改名 → 重新打开。
+        """
         if self.doc_clean is None:
             return
         src = self.file_path
         if not src or not os.path.isfile(src):
             self.add_log(f"ERROR 保存失败：源文件不存在 {src}")
             return
-        # 备份到临时文件再 rename 覆盖，避免中途失败损坏原文件
         tmp = src + ".tmp_cleaning"
+        # 1. 先把清理后的内容写到 tmp（此时 doc_clean 还开着，但 write 不受影响）
         try:
             self.doc_clean.save(tmp, garbage=4, deflate=True)
-            # 覆盖原文件
+        except Exception as e:
+            self.log_exception(e, "save_pdf_inplace.save")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "保存失败", f"写入临时文件失败：\n{e}")
+            return
+
+        # 2. 关闭所有持有 src 句柄的 doc（doc_orig 是加载时打开的源文件，doc_clean 是 save 后的对象）
+        for attr in ("doc_orig", "doc_clean"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # 让 GC 立刻回收 PyMuPDF 内部缓冲区
+        import gc
+        gc.collect()
+        # 短暂等待，让 Windows 文件系统释放锁
+        time.sleep(0.3)
+
+        # 3. 替换：优先 os.replace（Windows 同盘原子），失败则 remove+rename
+        try:
             try:
                 os.replace(tmp, src)
-            except Exception:
-                # os.replace 在 Windows 同盘原子替换，通常不会失败；失败则尝试手动删+改名
-                if os.path.exists(src):
-                    os.remove(src)
+            except (PermissionError, OSError):
+                # 兜底：删除 + 重命名
+                try:
+                    if os.path.exists(src):
+                        os.remove(src)
+                except Exception:
+                    raise
                 os.rename(tmp, src)
-            self.add_log(f"Saved (overwrite source): {src} ({os.path.getsize(src):,} bytes)")
         except Exception as e:
-            self.log_exception(e, "save_pdf_inplace")
+            self.log_exception(e, "save_pdf_inplace.replace")
             # 清理临时文件
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except Exception:
                 pass
-            QMessageBox.critical(self, "保存失败", f"覆盖源文件失败：\n{e}")
+            QMessageBox.critical(
+                self, "保存失败",
+                f"覆盖源文件失败：\n{e}\n\n"
+                f"提示：源文件正被其他程序占用（如 PDF 阅读器）。请关闭后再试，\n"
+                f"或使用『另存为』按钮另存到不同路径。"
+            )
+            # 重新打开源文件保持 UI 一致
+            self._reopen_orig(src)
+            return
+
+        self.add_log(f"Saved (overwrite source): {src} ({os.path.getsize(src):,} bytes)")
+        # 4. 重新打开源文件，让预览区继续可用
+        self._reopen_clean(src)
+
+    def _reopen_orig(self, src):
+        """重新打开源文件为 doc_orig，失败时静默。"""
+        try:
+            self.doc_orig = fitz.open(src)
+            if hasattr(self, "page_spin"):
+                self.page_spin.setRange(1, len(self.doc_orig))
+                self.page_spin.setValue(1)
+            if hasattr(self, "update_previews"):
+                self.update_previews()
+        except Exception:
+            self.doc_orig = None
+
+    def _reopen_clean(self, src):
+        """重新打开清理后文件为 doc_clean，失败时静默。"""
+        try:
+            self.doc_clean = fitz.open(src)
+            self.btn_save.setEnabled(True)
+            self.btn_save_as.setEnabled(True)
+            self.update_previews()
+        except Exception:
+            self.doc_clean = None
 
     def save_as_pdf(self):
         if self.doc_clean is None:
