@@ -521,7 +521,7 @@ def locate_text_instances(path, text, size=None, rot=None, pages=None):
     """用 PyMuPDF 在页面上定位候选文本的所有实例位置（可解码 CID）。
     返回 {页索引: [(bbox...), ...]}，只匹配文本相同且 size 接近的实例。"""
     try:
-        import fitz as _f
+        import pymupdf as _f
     except ImportError:
         import pymupdf as _f
     doc = _f.open(path)
@@ -566,7 +566,7 @@ def find_and_remove_form(pdf, path, text) -> int:
     说明水印在 Form XObject 里 —— 删除所有页面上实际 Do 调用的 Form。
     返回删除的 Do 数。"""
     try:
-        import fitz as _f
+        import pymupdf as _f
     except ImportError:
         import pymupdf as _f
     want = text.replace(" ", "").strip()
@@ -905,7 +905,7 @@ def detect_image_watermarks(path, pdf, min_ratio=0.5, min_area_ratio=0.08):
     try:
         import pymupdf as _mupdf
     except ImportError:
-        import fitz as _mupdf
+        import pymupdf as _mupdf
     cand, stats = find_repeated_images(pdf, min_ratio)
     if not cand:
         return set(), stats
@@ -1060,10 +1060,7 @@ def verify_residual(path: str, keywords: list) -> dict:
     try:
         import pymupdf
     except ImportError:
-        try:
-            import fitz as pymupdf
-        except ImportError:
-            return out
+        return out
     doc = pymupdf.open(path)
     out["pages"] = doc.page_count
     out["encrypted"] = bool(doc.is_encrypted)
@@ -1153,6 +1150,817 @@ def main():
             print("验证通过：无残留。")
         else:
             print("验证: 未安装 PyMuPDF，跳过残留检查（pip install pymupdf 可启用）")
+
+
+# =========================================================================
+# P0/P1/P2/P3 扩展检测/删除通道
+# 由 main.py 的 _process_one 调用；每个 detect_ 返回 dict，包含 main.py 读取的字段。
+# 设计原则：
+#   - detect_* 保守：宁可多报不漏报
+#   - remove_* 尽量安全：只删明显水印特征的对象，不动正文
+#   - 部分通道（Type3/Nested/Pattern/Structure/Outline）仅报告不删除
+# =========================================================================
+import re as _re
+from collections import Counter as _Counter
+
+# 水印注释常用 Subtype
+_ANNOT_WM_SUBTYPES = {"/Watermark", "/Text", "/FreeText", "/Stamp", "/FileAttachment"}
+
+# 水印图层名常用关键词
+_OC_WATERMARK_KEYWORDS = ["watermark", "水印", "wm", "confidential", "机密", "internal", "sample"]
+
+# 低透明度阈值（alpha < 0.3 且字号较大时疑似水印）
+_LOW_ALPHA_THRESHOLD = 0.3
+
+# 匹配 /Artifact <<...>> BDC ... EMC 块（Adobe 字符级水印）
+_ADOBE_BDC_EMC_RE = _re.compile(rb'/Artifact\s*<<[^>]*>>\s*BDC[\s\S]*?EMC')
+
+# Adobe XObject 名（Form 里 /PieceInfo/ADBE_CompoundType/Private=/Watermark）
+_ADOBE_WM_PIECEINFO_RE = _re.compile(
+    rb'/PieceInfo\s*/ADBE_CompoundType\s*<<[^>]*?/Private\s*/Watermark',
+    _re.DOTALL,
+)
+
+
+def _safe_name(n) -> str:
+    """pikepdf Name 转字符串，去掉斜杠。"""
+    try:
+        return str(n).lstrip("/")
+    except Exception:
+        return str(n)
+
+
+def _safe_read(stream_obj) -> bytes:
+    """pikepdf Stream 的 read_bytes 兜底。图片 XObject 不解压（扫描件会卡死）。"""
+    if stream_obj is None:
+        return b""
+    try:
+        st = stream_obj.get("/Subtype", None)
+        if st is not None and _safe_name(st) == "Image":
+            return b""
+    except Exception:
+        pass
+    try:
+        return stream_obj.read_bytes()
+    except Exception:
+        try:
+            return bytes(stream_obj.read_raw_bytes())
+        except Exception:
+            return b""
+
+
+def _iter_contents(page):
+    """页面内容流：Array 逐个，单个 Stream 包成列表。禁止 `for cs in page.Contents`（Stream 当 dict 迭代）。"""
+    try:
+        contents = page.Contents
+    except Exception:
+        return []
+    if contents is None:
+        return []
+    if isinstance(contents, pikepdf.Array):
+        return [s for s in contents if s is not None]
+    return [contents]
+
+
+# --------------------------------------------------------------------- P0: Adobe
+def detect_adobe_watermarks(pdf) -> dict:
+    """检测 Adobe 字符级水印：/Artifact <<Subtype/Watermark>> BDC ... EMC 块。
+
+    返回: {'page_count', 'bdc_blocks', 'wm_xobj_names', 'sample_page'}
+    """
+    total_pages = len(pdf.pages)
+    total_bdc = 0
+    wm_xobj_names: set = set()
+    sample_page = None
+
+    for pno, page in enumerate(pdf.pages):
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            for m in _ADOBE_BDC_EMC_RE.finditer(data):
+                total_bdc += 1
+                if sample_page is None:
+                    sample_page = pno
+        # 收集带 /Watermark Private 的 Form XObject 名
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        xo = res.get("/XObject", None)
+        if xo is None:
+            continue
+        for name in xo.keys():
+            try:
+                obj = xo[name]
+                if obj is None:
+                    continue
+                raw = _safe_read(obj)
+                if _ADOBE_WM_PIECEINFO_RE.search(raw):
+                    wm_xobj_names.add(_safe_name(name))
+            except Exception:
+                continue
+
+    return {
+        "page_count": total_pages,
+        "bdc_blocks": total_bdc,
+        "wm_xobj_names": wm_xobj_names,
+        "sample_page": sample_page,
+    }
+
+
+def remove_adobe_watermarks(pdf) -> dict:
+    """删除所有 Adobe 字符级水印：
+       1. 从每个页面内容流删除 BDC/EMC 块
+       2. 从 Resources/XObject 删除 /Private=/Watermark 的 Form
+    """
+    bdc_removed = 0
+    xobj_removed = 0
+
+    for page in pdf.pages:
+        # 1) 删除 BDC/EMC
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            new_data, n = _ADOBE_BDC_EMC_RE.subn(b"", data)
+            if n:
+                bdc_removed += n
+                try:
+                    cs.write(new_data)
+                except Exception:
+                    pass
+
+        # 2) 删除带 /Watermark 的 Form XObject
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        xo = res.get("/XObject", None)
+        if xo is None:
+            continue
+        to_remove = []
+        for name in list(xo.keys()):
+            try:
+                obj = xo[name]
+                if obj is None:
+                    continue
+                raw = _safe_read(obj)
+                if _ADOBE_WM_PIECEINFO_RE.search(raw):
+                    to_remove.append(name)
+            except Exception:
+                continue
+        for name in to_remove:
+            try:
+                del xo[name]
+                xobj_removed += 1
+            except Exception:
+                pass
+
+    return {"bdc_removed": bdc_removed, "xobj_removed": xobj_removed}
+
+
+# --------------------------------------------------------------------- P0: Annotation
+def detect_annotation_watermarks(pdf) -> dict:
+    """检测页面上 /Watermark 或常见水印 subtype 的注释。"""
+    subtypes: dict = {}
+    total = 0
+    sample_page = None
+    for pno, page in enumerate(pdf.pages):
+        annots = page.get("/Annots", None)
+        if annots is None:
+            continue
+        for a in annots:
+            try:
+                st = a.get("/Subtype", None)
+                if st is None:
+                    continue
+                st_str = _safe_name(st)
+                key = f"/{st_str}"
+                if key not in _ANNOT_WM_SUBTYPES:
+                    continue
+                total += 1
+                subtypes[key] = subtypes.get(key, 0) + 1
+                if sample_page is None:
+                    sample_page = pno
+            except Exception:
+                continue
+    return {
+        "page_count": len(pdf.pages),
+        "total": total,
+        "subtypes": subtypes,
+        "sample_page": sample_page,
+        "samples": {},
+    }
+
+
+def remove_annotation_watermarks(pdf) -> int:
+    """删除所有水印类注释。"""
+    removed = 0
+    for page in pdf.pages:
+        annots = page.get("/Annots", None)
+        if annots is None:
+            continue
+        keep = []
+        for a in annots:
+            try:
+                st = a.get("/Subtype", None)
+                if st is None:
+                    keep.append(a)
+                    continue
+                st_str = _safe_name(st)
+                key = f"/{st_str}"
+                if key in _ANNOT_WM_SUBTYPES:
+                    removed += 1
+                else:
+                    keep.append(a)
+            except Exception:
+                keep.append(a)
+        try:
+            page[pikepdf.Name("/Annots")] = pikepdf.Array(keep)
+        except Exception:
+            pass
+    return removed
+
+
+# --------------------------------------------------------------------- P0: OCG 图层
+def _is_watermark_layer_name(name: str) -> bool:
+    if not name:
+        return False
+    low = name.lower()
+    for kw in _OC_WATERMARK_KEYWORDS:
+        if kw.lower() in low:
+            return True
+    return False
+
+
+def detect_ocg_watermarks(pdf) -> dict:
+    """检测 OCG 图层里名字含水印关键词的图层，以及各图层被引用的次数。
+
+    返回: {'page_count', 'layers': [{'name','visible','bdc_refs','color'}], 'total'}
+    """
+    total_pages = len(pdf.pages)
+    # 1) 收集 OCG 名称
+    ocgs_info = []
+    try:
+        ocs = pdf.Root.get("/OCProperties", None)
+        if ocs is not None:
+            d = ocs.get("/OCGs", None)
+            if d is not None:
+                for entry in d:
+                    try:
+                        nm = entry.get("/Name", None)
+                        name = _safe_name(nm) if nm is not None else ""
+                        visible = entry.get("/On", None)
+                        on = visible is not None and str(visible) == "true"
+                        color = entry.get("/Color", None)
+                        try:
+                            color_tuple = tuple(float(x) for x in color) if color is not None else None
+                        except Exception:
+                            color_tuple = None
+                        ocgs_info.append({
+                            "name": name,
+                            "visible": on,
+                            "bdc_refs": 0,
+                            "color": color_tuple,
+                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # 2) 统计每个 OCG 被 BDC 引用的次数
+    for page in pdf.pages:
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            for m in _re.finditer(rb'/OC\s*/([^\s/>]+)', data):
+                oname = _safe_name(m.group(1))
+                for info in ocgs_info:
+                    if info["name"] == oname:
+                        info["bdc_refs"] += 1
+                        break
+
+    # 3) 过滤出水印图层
+    wm_layers = [info for info in ocgs_info
+                 if _is_watermark_layer_name(info["name"]) and info["bdc_refs"] > 0]
+    return {
+        "page_count": total_pages,
+        "layers": wm_layers,
+        "total": sum(i["bdc_refs"] for i in wm_layers),
+    }
+
+
+def remove_ocg_watermarks(pdf, layer_names=None) -> dict:
+    """删除指定 OCG 图层（按名字）：
+       1. 从内容流删除 BDC...EMC 包裹块
+       2. 从 Root/OCProperties 移除图层定义
+    """
+    if not layer_names:
+        return {"bdc_removed": 0, "layers_removed": 0}
+
+    target_set = set(layer_names)
+    bdc_removed = 0
+    layers_removed = 0
+
+    for page in pdf.pages:
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            new = data
+            for nm in target_set:
+                # 匹配 /OC /LayerName BDC ... EMC
+                pat = _re.compile(rb'/OC\s*/' + _re.escape(nm.encode()) + rb'\s*BDC[\s\S]*?EMC')
+                new, n = pat.subn(b"", new)
+                bdc_removed += n
+            if new != data:
+                try:
+                    cs.write(new)
+                except Exception:
+                    pass
+
+    # 从 OCGProperties 删除图层定义
+    try:
+        ocs = pdf.Root.get("/OCProperties", None)
+        if ocs is not None:
+            d = ocs.get("/OCGs", None)
+            if d is not None:
+                keep = []
+                for entry in d:
+                    try:
+                        nm = entry.get("/Name", None)
+                        name = _safe_name(nm) if nm is not None else ""
+                        if name in target_set:
+                            layers_removed += 1
+                            continue
+                    except Exception:
+                        pass
+                    keep.append(entry)
+                try:
+                    ocs[pikepdf.Name("/OCGs")] = pikepdf.Array(keep)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {"bdc_removed": bdc_removed, "layers_removed": layers_removed}
+
+
+# --------------------------------------------------------------------- P0: Form XObject /Watermark 键
+def detect_xobject_watermark_key(pdf) -> dict:
+    """检测 Form XObject 字典里带 /Watermark 键或 /Subtype=/Watermark 的对象。"""
+    total = 0
+    samples = []
+    for pno, page in enumerate(pdf.pages):
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        xo = res.get("/XObject", None)
+        if xo is None:
+            continue
+        for name in xo.keys():
+            try:
+                obj = xo[name]
+                if obj is None:
+                    continue
+                # 检查子对象字典
+                if "/Watermark" in obj:
+                    total += 1
+                    if len(samples) < 5:
+                        samples.append({"page": pno, "name": _safe_name(name), "reason": "/Watermark key"})
+                    continue
+                st = obj.get("/Subtype", None)
+                if st is not None and _safe_name(st) == "Watermark":
+                    total += 1
+                    if len(samples) < 5:
+                        samples.append({"page": pno, "name": _safe_name(name), "reason": "/Subtype=/Watermark"})
+                    continue
+                # 检查 PieceInfo
+                raw = _safe_read(obj)
+                if _ADOBE_WM_PIECEINFO_RE.search(raw):
+                    total += 1
+                    if len(samples) < 5:
+                        samples.append({"page": pno, "name": _safe_name(name), "reason": "ADBE CompoundType Watermark"})
+            except Exception:
+                continue
+    return {"total": total, "samples": samples}
+
+
+def remove_xobject_watermark_key(pdf) -> int:
+    """从页面 Resources/XObject 里删除带 /Watermark 特征的对象。"""
+    removed = 0
+    for page in pdf.pages:
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        xo = res.get("/XObject", None)
+        if xo is None:
+            continue
+        to_remove = []
+        for name in list(xo.keys()):
+            try:
+                obj = xo[name]
+                if obj is None:
+                    continue
+                if "/Watermark" in obj:
+                    to_remove.append(name)
+                    continue
+                st = obj.get("/Subtype", None)
+                if st is not None and _safe_name(st) == "Watermark":
+                    to_remove.append(name)
+                    continue
+                raw = _safe_read(obj)
+                if _ADOBE_WM_PIECEINFO_RE.search(raw):
+                    to_remove.append(name)
+            except Exception:
+                continue
+        for name in to_remove:
+            try:
+                del xo[name]
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+# --------------------------------------------------------------------- P1: ExtGState alpha
+def detect_extgstate_alpha_watermarks(pdf) -> dict:
+    """检测 ExtGState 里 alpha（/CA 或 /ca）小于阈值的对象。
+
+    返回: {'total', 'gstate_names', 'samples'}
+    """
+    total = 0
+    gstate_names: set = set()
+    samples = []
+    for pno, page in enumerate(pdf.pages):
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        gs_dict = res.get("/ExtGState", None)
+        if gs_dict is None:
+            continue
+        for name in gs_dict.keys():
+            try:
+                gs = gs_dict[name]
+                if gs is None:
+                    continue
+                alpha_val = None
+                for k in ("/CA", "/ca"):
+                    v = gs.get(k, None)
+                    if v is not None:
+                        try:
+                            alpha_val = float(v)
+                            break
+                        except Exception:
+                            continue
+                if alpha_val is not None and 0.0 < alpha_val < _LOW_ALPHA_THRESHOLD:
+                    total += 1
+                    gname = _safe_name(name)
+                    gstate_names.add(gname)
+                    if len(samples) < 5:
+                        samples.append({"page": pno, "name": gname, "alpha": alpha_val})
+            except Exception:
+                continue
+    return {"total": total, "gstate_names": gstate_names, "samples": samples}
+
+
+def remove_extgstate_alpha_watermarks(pdf, gstate_names=None) -> int:
+    """从内容流删除低 alpha gstate 的 /GS 调用；从 ExtGState 字典删除对应条目。"""
+    if not gstate_names:
+        return 0
+    name_set = set(gstate_names)
+    removed = 0
+    for page in pdf.pages:
+        # 1) 删除 /GS /Name 调用（只删指定 gstate）
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            new = data
+            for nm in name_set:
+                pat = _re.compile(rb'/GS\s*/' + _re.escape(nm.encode()) + rb'(?=\s|[TfS])')
+                new, n = pat.subn(b"", new)
+                removed += n
+            if new != data:
+                try:
+                    cs.write(new)
+                except Exception:
+                    pass
+
+        # 2) 从 ExtGState 字典里删除这些条目
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        gs_dict = res.get("/ExtGState", None)
+        if gs_dict is None:
+            continue
+        for nm in list(gs_dict.keys()):
+            if _safe_name(nm) in name_set:
+                try:
+                    del gs_dict[nm]
+                except Exception:
+                    pass
+    return removed
+
+
+# --------------------------------------------------------------------- P1: Type3 字体
+def detect_type3_fonts(pdf) -> dict:
+    """检测 Type3 字体（部分水印工具用 Type3 生成水印文本）。仅报告。"""
+    total = 0
+    fonts = []
+    for pno, page in enumerate(pdf.pages):
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        f_dict = res.get("/Font", None)
+        if f_dict is None:
+            continue
+        for fname in f_dict.keys():
+            try:
+                f = f_dict[fname]
+                if f is None:
+                    continue
+                ft = f.get("/Subtype", None)
+                if ft is not None and _safe_name(ft) == "Type3":
+                    total += 1
+                    if len(fonts) < 10:
+                        fonts.append({"page": pno, "name": _safe_name(fname)})
+            except Exception:
+                continue
+    return {"total": total, "fonts": fonts}
+
+
+# --------------------------------------------------------------------- P1: 嵌套 Form
+def detect_nested_form_xobjects(pdf) -> dict:
+    """检测嵌套 Form XObject（Form 内引用 Form）。可能藏水印。仅报告。"""
+    total = 0
+    chains = []
+    for pno, page in enumerate(pdf.pages):
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        xo = res.get("/XObject", None)
+        if xo is None:
+            continue
+        for name in xo.keys():
+            try:
+                obj = xo[name]
+                if obj is None:
+                    continue
+                if obj.get("/Subtype", None) is None:
+                    continue
+                st = _safe_name(obj.get("/Subtype", None))
+                if st != "Form":
+                    continue
+                # Form 的 Resources 里再找 Form
+                inner_res = obj.get("/Resources", None)
+                if inner_res is None:
+                    continue
+                inner_xo = inner_res.get("/XObject", None)
+                if inner_xo is None:
+                    continue
+                inner_form_names = []
+                for iname in inner_xo.keys():
+                    try:
+                        io = inner_xo[iname]
+                        if io is None:
+                            continue
+                        ist = io.get("/Subtype", None)
+                        if ist is not None and _safe_name(ist) == "Form":
+                            inner_form_names.append(_safe_name(iname))
+                    except Exception:
+                        continue
+                if inner_form_names:
+                    total += len(inner_form_names)
+                    if len(chains) < 10:
+                        chains.append({
+                            "page": pno,
+                            "outer": _safe_name(name),
+                            "inners": inner_form_names,
+                        })
+            except Exception:
+                continue
+    return {"total": total, "chains": chains}
+
+
+# --------------------------------------------------------------------- P2: URI 链接注释
+def detect_uri_link_annotations(pdf) -> dict:
+    """检测 /URI 链接注释（很多"水印链接"其实是 URI 注释）。"""
+    total = 0
+    samples = []
+    for pno, page in enumerate(pdf.pages):
+        annots = page.get("/Annots", None)
+        if annots is None:
+            continue
+        for a in annots:
+            try:
+                st = a.get("/Subtype", None)
+                if st is None or _safe_name(st) != "Link":
+                    continue
+                uri = a.get("/A", None)
+                if uri is None:
+                    continue
+                uri_obj = uri.get("/URI", None)
+                if uri_obj is None:
+                    continue
+                total += 1
+                if len(samples) < 10:
+                    samples.append({"page": pno, "uri": str(uri_obj)})
+            except Exception:
+                continue
+    return {"total": total, "samples": samples}
+
+
+def remove_uri_link_annotations(pdf) -> int:
+    """删除所有 /Link /A /URI 注释。"""
+    removed = 0
+    for page in pdf.pages:
+        annots = page.get("/Annots", None)
+        if annots is None:
+            continue
+        keep = []
+        for a in annots:
+            try:
+                st = a.get("/Subtype", None)
+                if st is not None and _safe_name(st) == "Link":
+                    uri = a.get("/A", None)
+                    if uri is not None and uri.get("/URI", None) is not None:
+                        removed += 1
+                        continue
+            except Exception:
+                pass
+            keep.append(a)
+        try:
+            page[pikepdf.Name("/Annots")] = pikepdf.Array(keep)
+        except Exception:
+            pass
+    return removed
+
+
+# --------------------------------------------------------------------- P2: Pattern/Shading
+def detect_pattern_shading(pdf) -> dict:
+    """检测 Pattern 和 Shading 资源（可能用于装饰性水印）。仅报告。"""
+    patterns = 0
+    shadings = 0
+    samples = []
+    for pno, page in enumerate(pdf.pages):
+        res = page.get("/Resources", None)
+        if res is None:
+            continue
+        pd = res.get("/Pattern", None)
+        if pd is not None:
+            for k in pd.keys():
+                patterns += 1
+                if len(samples) < 5:
+                    samples.append({"page": pno, "kind": "Pattern", "name": _safe_name(k)})
+        sd = res.get("/Shading", None)
+        if sd is not None:
+            for k in sd.keys():
+                shadings += 1
+                if len(samples) < 10:
+                    samples.append({"page": pno, "kind": "Shading", "name": _safe_name(k)})
+    return {
+        "patterns": patterns,
+        "shadings": shadings,
+        "total": patterns + shadings,
+        "samples": samples,
+    }
+
+
+# --------------------------------------------------------------------- P2: 结构标签 Artifact
+def detect_structure_artifacts(pdf) -> dict:
+    """检测 /StructTreeRoot 里的 Artifact 节点（结构水印）。仅报告。"""
+    total = 0
+    samples = []
+    try:
+        s = pdf.Root.get("/StructTreeRoot", None)
+        if s is None:
+            return {"total": 0, "samples": []}
+        # 遍历 K 子树。禁止 walk /P（父指针）——会沿父子来回死循环。
+        seen = set()
+        def walk(node, depth=0):
+            nonlocal total
+            if node is None or depth > 40:
+                return
+            try:
+                ident = id(node)
+                if ident in seen:
+                    return
+                seen.add(ident)
+                if isinstance(node, pikepdf.Dictionary):
+                    st = node.get("/S", None)
+                    if st is not None and _safe_name(st) == "Artifact":
+                        total += 1
+                        if len(samples) < 10:
+                            samples.append({"type": "Artifact", "dict": str(node)[:200]})
+                    k = node.get("/K", None)
+                    if k is not None:
+                        if isinstance(k, pikepdf.Array):
+                            for child in k:
+                                walk(child, depth + 1)
+                        else:
+                            walk(k, depth + 1)
+                elif isinstance(node, pikepdf.Array):
+                    for child in node:
+                        walk(child, depth + 1)
+            except Exception:
+                pass
+        walk(s)
+    except Exception:
+        pass
+    return {"total": total, "samples": samples}
+
+
+# --------------------------------------------------------------------- P2: 轮廓描边（BT/ET 里的描边）
+def detect_outline_stroke_watermarks(pdf) -> dict:
+    """检测 BT..ET 里带 'S'/'B' 描边操作符的文本块（可能水印）。仅报告。"""
+    total = 0
+    samples = []
+    for pno, page in enumerate(pdf.pages):
+        for cs in _iter_contents(page):
+            data = _safe_read(cs)
+            if not data:
+                continue
+            # 快速检查有没有 S/B 描边操作（在字符串外）
+            for m in _re.finditer(rb'\b([TB]S|S|B)\b', data):
+                total += 1
+                if len(samples) < 5:
+                    samples.append({"page": pno, "op": m.group(1).decode()})
+                break
+    return {"total": total, "samples": samples}
+
+
+# --------------------------------------------------------------------- P3: 元数据
+def detect_metadata_watermark(pdf) -> dict:
+    """检测文档元数据（XMP + Info 字典）。"""
+    info_keys = {}
+    try:
+        if pdf.Root.Trailer:
+            info = pdf.Root.Trailer.get("/Info", None)
+            if info is not None:
+                for k in ("/Title", "/Author", "/Creator", "/Producer",
+                          "/Subject", "/Keywords", "/Company", "/Comments"):
+                    v = info.get(k, None)
+                    if v is not None:
+                        info_keys[k] = str(v)
+    except Exception:
+        pass
+    xmp_present = False
+    xmp_size = 0
+    try:
+        if pdf.Root.Trailer:
+            # XMP 通常作为 /Metadata 对象
+            meta = pdf.Root.get("/Metadata", None)
+            if meta is not None:
+                data = _safe_read(meta)
+                if b"<x:xmpmeta" in data or b"adobe:xmp" in data.lower():
+                    xmp_present = True
+                    xmp_size = len(data)
+    except Exception:
+        pass
+    return {
+        "info_keys": info_keys,
+        "xmp_present": xmp_present,
+        "xmp_size": xmp_size,
+    }
+
+
+def remove_metadata_watermark(pdf) -> int:
+    """删除元数据（Info 字典 + XMP）。返回删除的字段数。"""
+    removed = 0
+    # 1) 清空 Info
+    try:
+        if pdf.Root.Trailer:
+            info = pdf.Root.Trailer.get("/Info", None)
+            if info is not None:
+                for k in list(info.keys()):
+                    try:
+                        del info[k]
+                        removed += 1
+                    except Exception:
+                        pass
+                # 如果 Info 变空，删掉整个
+                try:
+                    if len(info.keys()) == 0:
+                        del pdf.Root.Trailer[pikepdf.Name("/Info")]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # 2) 删 XMP
+    try:
+        if pdf.Root.Trailer:
+            meta = pdf.Root.get("/Metadata", None)
+            if meta is not None:
+                try:
+                    del pdf.Root[pikepdf.Name("/Metadata")]
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
+
 
 
 if __name__ == "__main__":

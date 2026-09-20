@@ -5,7 +5,15 @@ build_ag/
 build_on/
 build_agent/
 dist/
+dist_dir/
 *.spec
 .venv/
 venv/
 *.log
+# 本地测试/临时脚本不进入仓库
+test_*.py
+*.bak
+_p0p3_extension.py
+analyze_2024.py
+analyze_rects.py
+remove_adobe_watermark.py

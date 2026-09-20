@@ -51,7 +51,7 @@ def main():
         import pymupdf
     except ImportError:
         try:
-            import fitz as pymupdf
+            import pymupdf as pymupdf
         except ImportError:
             print("[2] 未安装 PyMuPDF，跳过文本残留检查（pip install pymupdf）")
             pymupdf = None

@@ -23,14 +23,14 @@ import os
 import re
 import sys
 
-import fitz
+import pymupdf as fitz
 import pikepdf
 import pdf_dewatermark as dw
 
 
 # ---------------------------------------------------------------- 检测
 def _detect_text(path, ratio):
-    import fitz
+    import pymupdf as fitz
     doc = fitz.open(path)
     n = doc.page_count
     th = max(2, int(n * ratio))
@@ -91,7 +91,7 @@ def _detect_image(path, ratio):
             pass
     out = []
     if img_obj:
-        import fitz
+        import pymupdf as fitz
         doc = fitz.open(path)
         for g in sorted(img_obj, key=lambda x: x[0]):
             xref = g[0]
@@ -127,7 +127,7 @@ def detect(path, ratio=0.3):
 # ---------------------------------------------------------------- 渲染候选预览图
 def render_crops(path, cands, outdir):
     """把每个候选所在的页面区域截图存成 PNG，供 Agent 看图确认。"""
-    import fitz
+    import pymupdf as fitz
     os.makedirs(outdir, exist_ok=True)
     doc = fitz.open(path)
     files = []
@@ -191,7 +191,7 @@ def remove(path, out_path, ids, ratio=0.3):
 
     # 复检
     try:
-        import fitz
+        import pymupdf as fitz
     except ImportError:
         fitz = None
     resid_txt = 0
@@ -225,7 +225,7 @@ def _clip_rect(c, page):
 def render_before_after(path, cands, outdir, ratio=0.3):
     """为每个候选生成 前/后 两张同区域截图：
     <id>_before.png（含水印）与 <id>_after.png（只删该候选后）。"""
-    import fitz
+    import pymupdf as fitz
     os.makedirs(outdir, exist_ok=True)
     files = []
     doc = fitz.open(path)
