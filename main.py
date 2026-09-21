@@ -13,6 +13,54 @@ import threading
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
+# --- Debug 模式（崩溃诊断）---
+# 启用方式：命令行 --debug 或环境变量 PDF_DEBUG=1
+# 日志输出到 %APPDATA%/ExtremePDFCleaner/logs/debug.log
+import faulthandler
+faulthandler.enable()
+
+DEBUG = os.environ.get('PDF_DEBUG', '').lower() in ('1', 'true', 'yes', 'on')
+if '--debug' in sys.argv:
+    DEBUG = True
+    sys.argv = [a for a in sys.argv if a != '--debug']
+
+DEBUG_LOG_PATH = os.path.join(
+    os.environ.get('APPDATA', os.path.expanduser('~')),
+    'ExtremePDFCleaner', 'logs', 'debug.log'
+)
+
+def _dbg(msg, *args):
+    """写 debug 日志到文件（线程安全，立即 flush，不受 GUI 影响）。"""
+    if not DEBUG:
+        return
+    try:
+        if args:
+            msg = msg % args
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        tid = threading.get_ident() % 10000
+        line = f'[{ts}] [T{tid}] {msg}'
+        with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+            f.flush()
+    except Exception:
+        pass  # debug 日志本身不能崩
+
+def _dbg_exc(ctx, exc):
+    """记录异常到 debug 日志。"""
+    _dbg(f'EXCEPTION in {ctx}: {type(exc).__name__}: {exc}')
+    _dbg(traceback.format_exc())
+
+# 全局未捕获异常 hook
+_orig_excepthook = sys.excepthook
+def _debug_excepthook(exc_type, exc_value, exc_tb):
+    try:
+        _dbg(f'UNCAUGHT: {exc_type.__name__}: {exc_value}')
+        _dbg(''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+    except Exception:
+        pass
+    _orig_excepthook(exc_type, exc_value, exc_tb)
+sys.excepthook = _debug_excepthook
+
 # --- 依赖自动检查与安装（在任何第三方库导入之前）---
 # 缺失依赖会阻止主程序启动；此模块只用标准库，因此任何第三方库缺失都检测得到
 REQUIRED_DEPS = {
@@ -20,6 +68,8 @@ REQUIRED_DEPS = {
     "pikepdf":   {"import_name": "pikepdf", "package": "pikepdf"},
     "PyQt6":     {"import_name": "PyQt6",  "package": "PyQt6"},
     "xxhash":    {"import_name": "xxhash", "package": "xxhash"},
+    "opencv-python": {"import_name": "cv2", "package": "opencv-python"},
+    "numpy":     {"import_name": "numpy",  "package": "numpy"},
 }
 
 
@@ -187,7 +237,7 @@ except Exception as _e:
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout, QHBoxLayout,
                              QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,
                              QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox,
-                             QMenu, QScrollBar, QRubberBand)
+                             QMenu, QScrollBar, QRubberBand, QRadioButton, QButtonGroup, QSlider)
 from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette, QTransform
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize, QRect, QPoint, QRectF
 
@@ -215,7 +265,9 @@ TRANSLATIONS = {
     "zh": {
         "title": "Extreme PDF Cleaner - 极速清理工具",
         "open": "📂 载入 PDF",
-        "clean": "⚡ 分析水印",
+        "clean": "⚡ 元素水印",
+        "img_wm": "🎨 色彩水印",
+        "dpi_wm": "🎯 图像水印",
         "save": "💾 保存",
         "save_as": "💾 另存为",
         "settings": "⚙️ 设置",
@@ -289,7 +341,9 @@ TRANSLATIONS = {
     "en": {
         "title": "Extreme PDF Cleaner",
         "open": "📂 Load PDF",
-        "clean": "⚡ Analyze Watermark",
+        "clean": "⚡ Element Watermark",
+        "img_wm": "🎨 Color Watermark",
+        "dpi_wm": "🎯 Image Watermark",
         "save": "💾 Save",
         "save_as": "💾 Save As",
         "settings": "⚙️ Settings",
@@ -957,7 +1011,7 @@ class EnhancedWatermarkDialog(QDialog):
                         fmt = QImage.Format.Format_RGB888 if pix.n == 3 else (
                             QImage.Format.Format_RGBA8888 if pix.n == 4 else QImage.Format.Format_Grayscale8
                         )
-                        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
+                        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
                         lab = QLabel()
                         lab._hi = qimg.copy()  # 原始高清(供悬停放大)
                         lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -1292,7 +1346,7 @@ class EnhancedWatermarkDialog(QDialog):
                        (view_h - 2 * margin) / page.rect.height)
             zoom = max(0.05, zoom)
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-            page_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            page_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
             canvas = QPixmap(pix.width + 2 * margin, pix.height + 2 * margin)
             canvas.fill(Qt.GlobalColor.white)
             painter = QPainter(canvas)
@@ -1351,10 +1405,13 @@ class EnhancedWatermarkDialog(QDialog):
             ink = (0.0, 0.0, 0.0)
             gray_bg = False
             if isinstance(color, int):
-                lum = 0.299 * ((color >> 16) & 255) + 0.587 * ((color >> 8) & 255) + 0.114 * (color & 255)
-                if lum >= 200:  # 偏白水印 -> 浅色字 + 灰底，否则看不清
+                r8 = (color >> 16) & 255
+                g8 = (color >> 8) & 255
+                b8 = color & 255
+                ink = (r8 / 255.0, g8 / 255.0, b8 / 255.0)
+                lum = 0.299 * r8 + 0.587 * g8 + 0.114 * b8
+                if lum >= 220:  # 偏白水印 -> 浅色字看不清，加灰底
                     gray_bg = True
-                    ink = (((color >> 16) & 255) / 255.0, ((color >> 8) & 255) / 255.0, (color & 255) / 255.0)
             td = _f.open()
             pg = td.new_page(width=max(50, w), height=max(40, h))
             # 精确居中：水平按文本估算宽度居中，垂直按行高中点
@@ -1364,7 +1421,7 @@ class EnhancedWatermarkDialog(QDialog):
             pg.insert_text(_f.Point(x0, y0), text, fontsize=size,
                            fontname="china-s", color=ink)
             pix = pg.get_pixmap(matrix=_f.Matrix(1.5, 1.5))
-            q = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            q = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
             td.close()
             rot = float(rot or 0.0)
             if abs(rot) > 0.5:
@@ -1499,12 +1556,211 @@ class EnhancedWatermarkDialog(QDialog):
     def get_apply_all(self):
         return self.apply_all_cb.isChecked()
 
+# --- 2.9 图像层水印去除对话框（P4：整页位图内的彩色广告水印） ---
+class ImageWmDialog(QDialog):
+    """让用户选择水印颜色和允许差异阈值，用于去除扫描 PDF 位图里的彩色水印。
+
+    算法思路（用户提出）：正文字体一般是黑色/灰色（三通道近似相等），
+    其他颜色基本就是水印颜色。因此把偏离灰度轴超过阈值的像素拉回灰度轴，
+    再 inpaint 补齐残影。
+
+    新增：跨页方差模式（水印每页相同时最准）
+    """
+    def __init__(self, parent=None, current_channel="sat", current_fill="inpaint", current_threshold=6, scale=1.0, current_mode="color"):
+        _dbg('ImageWmDialog.__init__ ENTER (channel=%s, fill=%s, threshold=%s, scale=%s, mode=%s)', current_channel, current_fill, current_threshold, scale, current_mode)
+        super().__init__(parent)
+        self.scale = scale
+        self.setWindowTitle("图像水印去除 - 设置参数")
+        self.setModal(True)
+        _dbg('ImageWmDialog setWindowTitle/setModal 完成')
+        self.setMinimumWidth(int(480 * scale))
+        _dbg('ImageWmDialog setMinimumWidth(%s) 完成' % (480 * scale))
+
+        layout = QVBoxLayout(self)
+
+        # 说明
+        info = QLabel(
+            "针对【整页扫描位图里的彩色水印】（如广告引流文字）。\n"
+            "\n"
+            "颜色阈值模式：正文字体通常是黑色或灰色（三通道近似相等），\n"
+            "偏离灰度轴超过阈值的像素视为水印，去色后 inpaint 补齐。\n"
+            "适合：整页是位图、水印是红色/彩色文字、正文是黑白。\n"
+            "不适合：正文本身是彩色（会被去色）。\n"
+            "\n"
+            "跨页方差模式（推荐）：水印每页相同（位置、尺寸、颜色一致），\n"
+            "但正文每页不同。跨页方差低的像素=水印，方差高的像素=正文。\n"
+            "不会误删彩色正文，水印颜色任意（红/蓝/绿/灰都行）。"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # 模式选择
+        layout.addWidget(QLabel("水印识别模式："))
+        self.bgrp_mode = QButtonGroup(self)
+        self.radio_variance = QRadioButton("跨页方差（推荐，水印每页相同时最准）")
+        self.radio_color = QRadioButton("颜色阈值（单页分析，快，需彩色水印）")
+        if current_mode == "variance":
+            self.radio_variance.setChecked(True)
+        else:
+            self.radio_color.setChecked(True)
+        for rb in [self.radio_variance, self.radio_color]:
+            self.bgrp_mode.addButton(rb)
+            layout.addWidget(rb)
+
+        # 颜色识别方式（仅颜色阈值模式）
+        self.color_section = QVBoxLayout()
+        self.color_section.addWidget(QLabel("颜色识别方式："))
+        self.bgrp = QButtonGroup(self)
+        self.radio_r = QRadioButton("R 通道优先（红色水印，R 比 G/B 高）")
+        self.radio_b = QRadioButton("B 通道优先（蓝色水印，B 比 R/G 高）")
+        self.radio_g = QRadioButton("G 通道优先（绿色水印，G 比 R/B 高）")
+        self.radio_sat = QRadioButton("最大通道差（任意彩色，通用，推荐）")
+        # 根据 current_channel 设置默认
+        _ch_map = {"r": self.radio_r, "b": self.radio_b, "g": self.radio_g, "sat": self.radio_sat}
+        (_ch_map.get(current_channel) or self.radio_sat).setChecked(True)
+        for rb in [self.radio_r, self.radio_b, self.radio_g, self.radio_sat]:
+            self.bgrp.addButton(rb)
+            self.color_section.addWidget(rb)
+
+        # 阈值（仅颜色阈值模式）
+        self.color_section.addLayout(QHBoxLayout())  # 空行
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(QLabel("允许差异阈值（≥此值视为水印）："))
+        self.threshold_spin = QSpinBox(); self.threshold_spin.setRange(2, 40); self.threshold_spin.setValue(current_threshold)
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal); self.threshold_slider.setRange(2, 40)
+        self.threshold_slider.setValue(current_threshold)
+        self.threshold_slider.setFixedWidth(200)
+        self.threshold_slider.valueChanged.connect(self.threshold_spin.setValue)
+        self.threshold_spin.valueChanged.connect(self.threshold_slider.setValue)
+        thr_row.addWidget(QLabel("阈值:"))
+        thr_row.addWidget(self.threshold_spin)
+        thr_row.addWidget(self.threshold_slider)
+        thr_row.addStretch()
+        self.color_section.addLayout(thr_row)
+        self.threshold_hint = QLabel("提示：值越小越敏感（可能误删彩色正文）；值越大越保守（可能漏删浅水印）。推荐 6-10。")
+        self.threshold_hint.setWordWrap(True)
+        self.threshold_hint.setStyleSheet("color: gray; font-size: 9pt;")
+        self.color_section.addWidget(self.threshold_hint)
+
+        # 方差阈值（仅跨页方差模式）
+        self.variance_section = QVBoxLayout()
+        var_row = QHBoxLayout()
+        var_row.addWidget(QLabel("方差阈值（≤此值视为水印）："))
+        self.variance_spin = QSpinBox(); self.variance_spin.setRange(10, 2000); self.variance_spin.setValue(200)
+        self.variance_slider = QSlider(Qt.Orientation.Horizontal); self.variance_slider.setRange(10, 2000)
+        self.variance_slider.setValue(200)
+        self.variance_slider.setFixedWidth(200)
+        self.variance_slider.valueChanged.connect(self.variance_spin.setValue)
+        self.variance_spin.valueChanged.connect(self.variance_slider.setValue)
+        var_row.addWidget(QLabel("方差:"))
+        var_row.addWidget(self.variance_spin)
+        var_row.addWidget(self.variance_slider)
+        var_row.addStretch()
+        self.variance_section.addLayout(var_row)
+        self.variance_hint = QLabel("提示：值越大越保守（只删最稳定的水印）；值越小越敏感（可能误删正文）。推荐 100-500。")
+        self.variance_hint.setWordWrap(True)
+        self.variance_hint.setStyleSheet("color: gray; font-size: 9pt;")
+        self.variance_section.addWidget(self.variance_hint)
+
+        # 填充方式
+        layout.addWidget(QLabel("残影处理："))
+        self.bgrp2 = QButtonGroup(self)
+        self.radio_precise = QRadioButton("精确保字（正文清晰，只填补背景，推荐）")
+        self.radio_inpaint = QRadioButton("去色 + Inpaint 填补（通用，稍慢）")
+        self.radio_ns = QRadioButton("去色 + Navier-Stokes（保边缘，细节好）")
+        self.radio_blur = QRadioButton("去色 + 模糊填充（快，可能有轻微残影）")
+        self.radio_color_only = QRadioButton("仅去色（最快，会有浅灰残影）")
+        # 根据 current_fill 设置默认
+        _fill_map = {"precise": self.radio_precise, "inpaint": self.radio_inpaint,
+                     "ns": self.radio_ns, "blur": self.radio_blur, "none": self.radio_color_only}
+        (_fill_map.get(current_fill) or self.radio_precise).setChecked(True)
+        for rb in [self.radio_precise, self.radio_inpaint, self.radio_ns, self.radio_blur, self.radio_color_only]:
+            self.bgrp2.addButton(rb)
+            layout.addWidget(rb)
+
+        # 模式切换：显示/隐藏相应控件
+        def on_mode_changed(mode):
+            show_var = (mode == "variance")
+            show_col = (mode == "color")
+            # 颜色相关控件
+            for i in range(self.color_section.count()):
+                item = self.color_section.itemAt(i)
+                w = item.widget() if item else None
+                if w:
+                    w.setVisible(show_col)
+            # 方差阈值控件
+            for i in range(self.variance_section.count()):
+                item = self.variance_section.itemAt(i)
+                w = item.widget() if item else None
+                if w:
+                    w.setVisible(show_var)
+            # 重新布局
+            self.layout().invalidate()
+
+        if current_mode == "variance":
+            self.radio_variance.setChecked(True)
+            on_mode_changed("variance")
+        else:
+            self.radio_color.setChecked(True)
+            on_mode_changed("color")
+
+        self.radio_variance.toggled.connect(lambda checked: on_mode_changed("variance" if checked else "color"))
+        self.radio_color.toggled.connect(lambda checked: on_mode_changed("color" if checked else "variance"))
+
+        # 添加各 section 到主布局
+        layout.addLayout(self.color_section)
+        layout.addLayout(self.variance_section)
+
+        # 按钮
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.btn_ok = QPushButton("开始处理"); self.btn_ok.setDefault(True)
+        self.btn_cancel = QPushButton("取消")
+        btns.addWidget(self.btn_ok)
+        btns.addWidget(self.btn_cancel)
+        layout.addLayout(btns)
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+
+    def get_settings(self):
+        if self.radio_variance.isChecked():
+            mode = "variance"
+            variance_threshold = self.variance_spin.value()
+        else:
+            mode = "color"
+            variance_threshold = 0
+        if self.radio_r.isChecked():
+            channel = "r"
+        elif self.radio_b.isChecked():
+            channel = "b"
+        elif self.radio_g.isChecked():
+            channel = "g"
+        else:
+            channel = "sat"
+        if self.radio_precise.isChecked():
+            fill = "precise"
+        elif self.radio_inpaint.isChecked():
+            fill = "inpaint"
+        elif self.radio_ns.isChecked():
+            fill = "ns"
+        elif self.radio_blur.isChecked():
+            fill = "blur"
+        else:
+            fill = "none"
+        return {
+            "mode": mode,
+            "channel": channel,
+            "fill": fill,
+            "threshold": self.threshold_spin.value(),
+            "variance_threshold": variance_threshold,
+        }
+
 # --- 3. 后台清理工作线程 ---
 class MasterWorker(QThread):
     progress = pyqtSignal(int)
     log_signal = pyqtSignal(str)
     need_confirm = pyqtSignal(dict, dict)
-    finished = pyqtSignal(object)
+    done = pyqtSignal(object, str)  # (fitz_doc, out_path)
     failed = pyqtSignal()
 
     def __init__(self, file_path, ratio_threshold=30):
@@ -1554,9 +1810,9 @@ class MasterWorker(QThread):
             if outputs and not self.stop_flag:
                 self.log_signal.emit(f">>> Batch processing finished: {len(outputs)} file(s)")
                 try:
-                    self.finished.emit(fitz.open(outputs[-1]))
+                    self.done.emit(fitz.open(outputs[-1]), outputs[-1])
                 except Exception:
-                    self.finished.emit(None)
+                    self.done.emit(None, "")
             elif self.stop_flag or not outputs:
                 self.failed.emit()
             if not outputs and not self.stop_flag:
@@ -2079,6 +2335,605 @@ class MasterWorker(QThread):
             self.log_signal.emit(f">>> Verify warning: text residual {resid} pages, image residual {len(left_imgs)}")
         return out_path
 
+# --- 3.9 图像层水印去除工作线程（P4：整页位图里的彩色广告水印） ---
+class ImageWmWorker(QThread):
+    """P4 图像层水印去除工作线程。
+
+    针对整页扫描位图内的彩色水印（如广告引流文字），水印和正文混合在同一张 RGB 位图里。
+    原理：正文字符通常是黑色/灰色（三通道近似相等），偏离灰度轴超过阈值的像素视为水印。
+
+    两步算法（SKILL 验证配方）：
+      Step 1: 去色 - mask 内三通道拉平为平均灰度
+      Step 2: inpaint - 用 TELEA 填补残影（避免只去色留灰色残影）
+
+    关键：用 pikepdf 逐 xref 换图，保留 SMask / 内容流 / 页面对象完整。
+    不用 fitz 渲染整页（会丢透明层）。
+    """
+    progress = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    done = pyqtSignal(str, str)  # (out_path, status)
+    failed = pyqtSignal(str)
+
+    def __init__(self, file_path, settings, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.settings = settings
+        self.stop_flag = False
+
+    def run(self):
+        import gc, time
+        import cv2, numpy as np
+        try:
+            ch = self.settings['channel']
+            fill = self.settings['fill']
+            th = int(self.settings['threshold'])
+            self.log_signal.emit(f">>> P4 图像水印去除: {os.path.basename(self.file_path)}")
+            self.log_signal.emit(f">>>   channel={ch}, fill={fill}, threshold={th}")
+
+            doc = pikepdf.open(self.file_path)
+            # 用 fitz 读像素（fitz.Pixmap(doc, xref) 最简洁）
+            fitz_doc = fitz.open(self.file_path)
+            n_pages = len(doc.pages)
+            proc = 0
+            skip = 0
+            
+            # 跨页方差模式：收集所有页面的灰度图，用于计算方差
+            # 水印每页相同 → 方差≈0；正文每页不同 → 方差大
+            page_gray_list = []
+            page_info_list = []  # 保存每页的 (pidx, name, val, w, h, xref, img)
+            
+            self.log_signal.emit(f">>> 第一轮：收集所有页面图像...")
+            
+            for pidx in range(n_pages):
+                if self.stop_flag:
+                    doc.close(); fitz_doc.close()
+                    self.failed.emit("cancelled")
+                    return
+                self.progress.emit(int(pidx * 50 / n_pages))  # 前50%是收集
+                page = doc.pages[pidx]
+                try:
+                    res = page.get('/Resources', None)
+                    xobj = res.get('/XObject', None) if res is not None else None
+                    if xobj is None:
+                        continue
+                except Exception:
+                    continue
+
+                for name, val in xobj.items():
+                    try:
+                        sub = val.get('/Subtype', None)
+                        if sub is None or str(sub) != '/Image':
+                            continue
+                        w = int(val.get('/Width', 0))
+                        h = int(val.get('/Height', 0))
+                        if w * h < 500:
+                            continue
+                        cs = val.get('/ColorSpace', None)
+                        cs_str = str(cs) if cs is not None else ''
+                        # 只处理 DeviceRGB（其他颜色空间不识别）
+                        if 'DeviceRGB' not in cs_str:
+                            continue
+                    except Exception:
+                        continue
+
+                    # 定位 fitz xref（pikepdf objgen 可能是 tuple 或 object）
+                    og = val.objgen
+                    xref = og[0] if isinstance(og, tuple) else og.obj
+                    try:
+                        pix = fitz.Pixmap(fitz_doc, xref)
+                    except Exception:
+                        continue
+
+                    # 读原始 RGB 字节
+                    try:
+                        if pix.n == 3 and not pix.alpha:
+                            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(h, w, 3).copy()
+                        elif pix.n == 1:
+                            # 灰度图无彩色水印
+                            continue
+                        else:
+                            continue
+                    except Exception:
+                        continue
+
+                    # 计算灰度图（用于跨页方差）
+                    gray = ((img[..., 0].astype(np.int16) + img[..., 1].astype(np.int16) + img[..., 2].astype(np.int16)) / 3).astype(np.uint8)
+                    page_gray_list.append(gray)
+                    page_info_list.append((pidx, name, val, w, h, xref, img))
+            
+            self.log_signal.emit(f">>> 收集完成：{len(page_gray_list)} 张图像")
+            
+            # 计算跨页方差（如果有多页）
+            variance_map = None
+            if len(page_gray_list) >= 2:
+                self.log_signal.emit(f">>> 计算跨页方差...")
+                try:
+                    # 检查所有图像尺寸是否一致
+                    ref_h, ref_w = page_gray_list[0].shape[:2]
+                    all_same_size = all(img.shape[0] == ref_h and img.shape[1] == ref_w for img in page_gray_list)
+                    
+                    if all_same_size:
+                        # 堆叠所有页面的灰度图，计算每个位置的方差
+                        stacked = np.stack(page_gray_list, axis=0)  # (n_pages, h, w)
+                        variance_map = np.var(stacked, axis=0).astype(np.float32)  # (h, w)
+                        self.log_signal.emit(f">>> 方差范围: {variance_map.min():.1f} - {variance_map.max():.1f}")
+                        del stacked  # 释放内存
+                    else:
+                        # 尺寸不一致，无法计算跨页方差
+                        sizes = set((img.shape[0], img.shape[1]) for img in page_gray_list)
+                        self.log_signal.emit(f">>> 图像尺寸不一致 {sizes}，无法计算跨页方差")
+                except Exception as e:
+                    self.log_signal.emit(f">>> 方差计算失败: {e}，降级到单页模式")
+            elif len(page_gray_list) == 1:
+                self.log_signal.emit(f">>> 只有1页，无法计算跨页方差，使用单页模式")
+            
+            # 第二轮：处理每页图像
+            self.log_signal.emit(f">>> 第二轮：处理图像...")
+            for i, (pidx, name, val, w, h, xref, img) in enumerate(page_info_list):
+                if self.stop_flag:
+                    doc.close(); fitz_doc.close()
+                    self.failed.emit("cancelled")
+                    return
+                self.progress.emit(int(50 + i * 50 / len(page_info_list)))
+                
+                # 构造 mask（按用户选择的通道）
+                r = img[..., 0].astype(np.int16)
+                g = img[..., 1].astype(np.int16)
+                b = img[..., 2].astype(np.int16)
+                if ch == "r":
+                    mask = ((r - g) >= th) & ((r - b) >= th)
+                elif ch == "b":
+                    mask = ((b - r) >= th) & ((b - g) >= th)
+                elif ch == "g":
+                    mask = ((g - r) >= th) & ((g - b) >= th)
+                else:  # sat
+                    mx = np.maximum(np.maximum(r, g), b)
+                    mn = np.minimum(np.minimum(r, g), b)
+                    mask = (mx - mn) >= th
+
+                n_mask = int(mask.sum())
+                ratio = n_mask / mask.size
+                self.log_signal.emit(f"  Page {pidx+1} {name} ({w}x{h}): {n_mask} colored ({ratio*100:.3f}%)")
+
+                if n_mask == 0:
+                    skip += 1
+                    continue
+                if ratio < 0.001:  # 太少的彩色像素，跳过避免误伤
+                    self.log_signal.emit(f"    -> skip (ratio < 0.1%)")
+                    skip += 1
+                    continue
+
+                # 步骤 1: 去色
+                mean = ((r + g + b) / 3).astype(np.uint8)
+                gray_rgb = np.stack([mean, mean, mean], axis=-1)
+                result = np.where(mask[..., None].astype(bool), gray_rgb, img)
+
+                # 步骤 2: 根据 fill 模式处理残影
+                if fill in ("inpaint", "ns", "precise"):
+                    mask_u8 = (mask.astype(np.uint8))
+                    kernel = np.ones((3, 3), np.uint8)
+                    mask_d = cv2.dilate(mask_u8, kernel, iterations=1)
+                    bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+                    if fill == "inpaint":
+                        inpainted = cv2.inpaint(bgr, mask_d, 5, cv2.INPAINT_TELEA)
+                        result = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+                    elif fill == "ns":
+                        # Navier-Stokes：沿等照线传播，比 Telea 更保边缘，文本细节更好
+                        inpainted = cv2.inpaint(bgr, mask_d, 3, cv2.INPAINT_NS)
+                        result = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+                    elif fill == "precise":
+                        # 精确保字 — 跨页方差版：
+                        #   1. 水印每页相同 → 方差≈0；正文每页不同 → 方差大
+                        #   2. 用方差区分：方差小=水印背景→白色，方差大=正文→黑色
+                        #   3. 不用 inpaint，只修改像素颜色
+                        
+                        if variance_map is not None:
+                            # 有跨页方差：用方差区分
+                            # 方差阈值：小于此值视为水印（每页相同），大于此值视为正文（每页不同）
+                            # 经验值：水印方差通常 < 50，正文方差通常 > 100
+                            variance_thresh = 50.0
+                            
+                            # 在水印区域内，用方差区分
+                            text_mask = (variance_map > variance_thresh) & mask
+                            bg_mask = mask & (~text_mask)
+                            
+                            self.log_signal.emit(f"    -> 方差阈值={variance_thresh}, 正文={text_mask.sum()}, 背景={bg_mask.sum()}")
+                        else:
+                            # 只有1页，无法计算方差，用 Otsu 降级
+                            lum_orig = mean  # uint8，原图灰度
+                            lum_in_mask = lum_orig[mask]
+                            if len(lum_in_mask) > 10:
+                                ret, _ = cv2.threshold(lum_in_mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                thresh_val = float(ret)
+                            else:
+                                thresh_val = 128.0
+                            text_mask = (lum_orig < thresh_val) & mask
+                            bg_mask = mask & (~text_mask)
+                            self.log_signal.emit(f"    -> 单页降级 Otsu 阈值={thresh_val:.1f}, 正文={text_mask.sum()}, 背景={bg_mask.sum()}")
+                        
+                        # 应用结果：正文 → 纯黑，背景 → 纯白
+                        result = result.copy()
+                        if int(bg_mask.sum()) > 0:
+                            result[bg_mask] = np.array([255, 255, 255], dtype=np.uint8)
+                        if int(text_mask.sum()) > 0:
+                            result[text_mask] = np.array([0, 0, 0], dtype=np.uint8)
+                elif fill == "blur":
+                    blur = cv2.GaussianBlur(result, (21, 21), 0)
+                    result = np.where(mask[..., None].astype(bool), blur, result)
+                # fill == "none": 仅去色
+
+                # 写回 pikepdf（关键：不压缩，让 doc.save 的 compress_streams 处理）
+                # SKILL 警告：不要用 filter=FlateDecode + decode_parms={}，会导致全黑
+                try:
+                    val['/Filter'] = pikepdf.Name.None_
+                    val['/DecodeParms'] = pikepdf.Dictionary()
+                except Exception:
+                    pass
+                try:
+                    val.write(result.tobytes(), filter=None, decode_parms=None)
+                    proc += 1
+                    self.log_signal.emit(f"    -> replaced ({result.tobytes().__len__()} bytes)")
+                except Exception as e:
+                    self.log_signal.emit(f"    -> write FAIL: {e}")
+
+            self.log_signal.emit(f">>> 处理完成: {proc} 张图替换, {skip} 张跳过")
+
+            # 输出路径：保存到系统临时目录（不污染用户工作目录）
+            import tempfile
+            base, ext = os.path.splitext(os.path.basename(self.file_path))
+            out_path = os.path.join(tempfile.gettempdir(), base + "_imgwm" + ext)
+            tmp_path = out_path + ".tmp"
+
+            # 先关 fitz（只读像素用），保留 pikepdf doc 里的修改
+            try: fitz_doc.close()
+            except Exception: pass
+            gc.collect()
+
+            # 保存修改后的 doc 到 tmp
+            self.log_signal.emit(">>> 保存中...")
+            doc.save(tmp_path, compress_streams=True,
+                     fix_metadata_version=False,
+                     object_stream_mode=pikepdf.ObjectStreamMode.generate)
+            doc.close()
+            gc.collect()
+            time.sleep(0.3)
+
+            # 用 os.replace 保存到目标路径（能覆盖已存在的同名文件）
+            try:
+                os.replace(tmp_path, out_path)
+                self.log_signal.emit(f">>> Saved: {out_path} ({os.path.getsize(out_path):,} bytes)")
+                self.progress.emit(100)
+                self.done.emit(out_path, "ok")
+            except Exception as e:
+                self.log_signal.emit(f">>> SAVE FAIL: {e}")
+                self.failed.emit(f"保存失败: {e}")
+
+        except Exception as ex:
+            import traceback
+            tb = traceback.format_exc()
+            self.log_signal.emit(f">>> ERROR: {ex}")
+            self.log_signal.emit(tb)
+            self.failed.emit(f"{ex}")
+
+# --- 3.10 按 DPI 去水印：选图后弹出匹配策略对话框 ---
+class DpiMatchDialog(QDialog):
+    """选图后弹出：让用户选匹配策略（DPI/尺寸）+ 删除范围（全 PDF/当前页）。"""
+    def __init__(self, parent=None, target=None, hits_count=1, scale=1.0, doc=None, page_idx=0):
+        _dbg('DpiMatchDialog.__init__ ENTER (target=%s, hits=%s, scale=%s)', type(target).__name__ if target else None, hits_count, scale)
+        super().__init__(parent)
+        self.scale = scale
+        self.setWindowTitle("按 DPI 去水印 - 选择匹配策略")
+        self.setModal(True)
+        self.target = target or {}
+        self.hits_count = hits_count
+        self.setMinimumWidth(int(520 * scale))
+        _dbg('DpiMatchDialog basic props 完成')
+
+        layout = QVBoxLayout(self)
+
+        # 选中图片信息
+        info = QLabel(
+            f"<b>选中图片信息</b><br>"
+            f"尺寸：{self.target.get('w', '?')} × {self.target.get('h', '?')} 像素<br>"
+            f"DPI：{self.target.get('dpi', '?')}<br>"
+            f"渲染面积：{self.target.get('area', 0):.0f} pt²<br>"
+            f"重叠图片数：{hits_count}"
+        )
+        info.setTextFormat(Qt.TextFormat.RichText)
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # 选中图片预览：解码水印元素本身的像素（不含正文）
+        layout.addWidget(QLabel("<b>选中图片预览：</b>"))
+        preview_label = QLabel("（预览生成中...）")
+        preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview_label.setMinimumSize(int(300 * scale), int(180 * scale))
+        preview_label.setStyleSheet(
+            "border: 2px dashed #4a9eff; background: #f4f6f8; border-radius: 5px;"
+        )
+        layout.addWidget(preview_label)
+        try:
+            if doc is not None and 'xref' in self.target:
+                import pymupdf as _fitz
+                from PIL import Image
+                # 解码水印元素本身（XObject 像素），而非在 PDF 页面内的截图
+                xref = self.target['xref']
+                smask_xref = self.target.get('smask', 0) or 0
+                # 解码颜色像素
+                pix_color = _fitz.Pixmap(doc, xref)
+                if pix_color.n not in (1, 3, 4):
+                    pix_color = _fitz.Pixmap(_fitz.csRGB, pix_color)
+                ow, oh = pix_color.width, pix_color.height
+                # 限制解码尺寸，避免超大 XObject 占满内存
+                max_px = int(700 * scale)
+                if ow > max_px or oh > max_px:
+                    zoom = min(max_px / ow, max_px / oh)
+                    ow, oh = int(ow * zoom), int(oh * zoom)
+                    pix_color = _fitz.Pixmap(pix_color, ow, oh)
+                if smask_xref:
+                    # 带透明通道：用 PIL 组合 RGB + alpha，再合成到白底
+                    try:
+                        pix_alpha = _fitz.Pixmap(doc, smask_xref)
+                        if pix_alpha.width == ow and pix_alpha.height == oh:
+                            col_mode = 'RGB' if pix_color.n == 3 else (
+                                'RGBA' if pix_color.n == 4 else 'L'
+                            )
+                            color_img = Image.frombytes(col_mode, (ow, oh), pix_color.samples)
+                            alpha_img = Image.frombytes('L', (ow, oh), pix_alpha.samples)
+                            if color_img.mode == 'L':
+                                color_img = color_img.convert('RGB')
+                            if color_img.mode == 'RGB':
+                                color_img = color_img.convert('RGBA')
+                            r, g, b = color_img.split()[:3]
+                            color_img = Image.merge('RGBA', (r, g, b, alpha_img))
+                            bg = Image.new('RGBA', (ow, oh), (255, 255, 255, 255))
+                            bg.alpha_composite(color_img)
+                            bg_rgb = bg.convert('RGB')
+                            qimg = QImage(
+                                bg_rgb.tobytes('raw', 'RGB'), ow, oh, 3 * ow,
+                                QImage.Format.Format_RGB888
+                            ).copy()
+                            preview_label.setPixmap(
+                                QPixmap.fromImage(qimg).scaled(
+                                    int(440 * scale), int(280 * scale),
+                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation
+                                )
+                            )
+                        else:
+                            # smask 尺寸不匹配，退化为纯颜色显示
+                            qimg = QImage(pix_color.samples, ow, oh, pix_color.stride,
+                                          QImage.Format.Format_RGB888 if pix_color.n == 3 else
+                                          QImage.Format.Format_Grayscale8).copy()
+                            preview_label.setPixmap(
+                                QPixmap.fromImage(qimg).scaled(
+                                    int(440 * scale), int(280 * scale),
+                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation
+                                )
+                            )
+                    except Exception:
+                        qimg = QImage(pix_color.samples, ow, oh, pix_color.stride,
+                                      QImage.Format.Format_RGB888 if pix_color.n == 3 else
+                                      QImage.Format.Format_Grayscale8).copy()
+                        preview_label.setPixmap(
+                            QPixmap.fromImage(qimg).scaled(
+                                int(440 * scale), int(280 * scale),
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation
+                            )
+                        )
+                else:
+                    # 无透明通道：直接显示颜色像素
+                    fmt = QImage.Format.Format_RGB888 if pix_color.n == 3 else (
+                        QImage.Format.Format_RGBA8888 if pix_color.n == 4 else
+                        QImage.Format.Format_Grayscale8
+                    )
+                    qimg = QImage(pix_color.samples, ow, oh, pix_color.stride, fmt).copy()
+                    preview_label.setPixmap(
+                        QPixmap.fromImage(qimg).scaled(
+                            int(440 * scale), int(280 * scale),
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                    )
+        except Exception as _e:
+            preview_label.setText(f"（预览失败：{_e}）")
+        _dbg('DpiMatchDialog preview 完成')
+
+        # 匹配策略
+        layout.addWidget(QLabel("<b>匹配策略：</b>"))
+        self.bgrp = QButtonGroup(self)
+        self.radio_dpi = QRadioButton("按 DPI 匹配（默认，匹配同 DPI 的图，如 130-170 范围）")
+        self.radio_size = QRadioButton("按精确尺寸匹配（只删同尺寸图，最保守）")
+        self.radio_dpi.setChecked(True)  # 默认 DPI
+        for rb in [self.radio_dpi, self.radio_size]:
+            self.bgrp.addButton(rb)
+            layout.addWidget(rb)
+
+        # 删除范围
+        layout.addWidget(QLabel("<b>删除范围：</b>"))
+        self.bgrp2 = QButtonGroup(self)
+        self.radio_all = QRadioButton("全 PDF（推荐，水印通常跨多页）")
+        self.radio_page = QRadioButton("只当前页（保守）")
+        self.radio_all.setChecked(True)  # 默认全 PDF
+        for rb in [self.radio_all, self.radio_page]:
+            self.bgrp2.addButton(rb)
+            layout.addWidget(rb)
+
+        # 提示
+        hint = QLabel(
+            "<i>说明：DPI 匹配会误删同 DPI 的其他图片（如低分辨率正文插图）；<br>"
+            "尺寸匹配最保守，但同 DPI 水印在不同页可能被切成不同尺寸（如老妖例会漏删）。<br>"
+            "推荐先试 DPI 匹配，看预览效果，如误删再改尺寸匹配。</i>"
+        )
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 9pt;")
+        layout.addWidget(hint)
+
+        # 按钮
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.btn_ok = QPushButton("开始匹配并删除"); self.btn_ok.setDefault(True)
+        self.btn_cancel = QPushButton("取消")
+        btns.addWidget(self.btn_ok)
+        btns.addWidget(self.btn_cancel)
+        layout.addLayout(btns)
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+
+    def get_match_mode(self):
+        return "dpi" if self.radio_dpi.isChecked() else "size"
+
+    def get_scope(self):
+        return "all" if self.radio_all.isChecked() else "page"
+
+
+# --- 3.11 按 DPI 去水印：后台线程 ---
+class DpiWmWorker(QThread):
+    """按 DPI/尺寸匹配的图片 xref 列表，从内容流中删除对应 Do 引用。"""
+    progress = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    done = pyqtSignal(str, str)  # (out_path, status)
+    failed = pyqtSignal(str)
+
+    def __init__(self, file_path, xrefs, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.xrefs = set(xrefs)
+        self.stop_flag = False
+
+    def run(self):
+        import gc, time, re
+        try:
+            self.log_signal.emit(f">>> 按 DPI 删除 {len(self.xrefs)} 张图片: {os.path.basename(self.file_path)}")
+
+            pdf = pikepdf.open(self.file_path)
+            self.log_signal.emit(f">>> PDF: {len(pdf.pages)} pages")
+
+            # 1. 找所有匹配 xref 的 objgen（用 pdf_dewatermark.find_image_objgens）
+            from pdf_dewatermark import find_image_objgens
+            all_imgs = find_image_objgens(pdf, self.xrefs)
+            self.log_signal.emit(f">>> 找到 {len(all_imgs)} 个 objgen 需要删除")
+
+            if not all_imgs:
+                pdf.close()
+                self.failed.emit("未找到任何匹配的 objgen")
+                return
+
+            # 2. 逐页扫描内容流，删除匹配的 Do 引用
+            deleted_count = 0
+            n_pages = len(pdf.pages)
+            for pidx in range(n_pages):
+                if self.stop_flag:
+                    pdf.close()
+                    self.failed.emit("cancelled")
+                    return
+                if pidx % 10 == 0:
+                    self.progress.emit(int(pidx * 80 / n_pages))
+                page = pdf.pages[pidx]
+                try:
+                    contents = page.get('/Contents', None)
+                except Exception:
+                    continue
+                if contents is None:
+                    continue
+
+                # Contents 可能是单个 Stream 或 Array of Stream
+                streams = []
+                if isinstance(contents, pikepdf.Array):
+                    streams = list(contents)
+                else:
+                    streams = [contents]
+
+                changed = False
+                page_matched_count = 0
+                for stream in streams:
+                    try:
+                        # 关键：read_bytes() 返回解压后的字节（可用 regex 匹配）
+                        # read_raw_bytes() 返回原始压缩字节，正则匹配不到 Do
+                        raw = stream.read_bytes().decode('latin-1', errors='replace')
+                    except Exception:
+                        continue
+                    # 找 Do 操作：/<name> Do
+                    # 需要知道 name 对应的 objgen 是否命中
+                    # 解析页 Resources/XObject 获取 name → objgen 映射
+                    name_to_objgen = {}
+                    try:
+                        res = page.get('/Resources', None)
+                        if res is not None:
+                            xobj = res.get('/XObject', None)
+                            if xobj is not None:
+                                for name, val in xobj.items():
+                                    # pikepdf Name 是 str 类型（带 / 前缀），去掉开头的 /
+                                    name_str = str(name).lstrip('/')
+                                    try:
+                                        og = val.objgen
+                                        # 直接用 pikepdf 原始 objgen（tuple 或对象，和 find_image_objgens 一致）
+                                        objgen_key = og
+                                        name_to_objgen[name_str] = objgen_key
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+                    # 删除匹配的 Do
+                    new_raw = raw
+                    stream_matched = 0
+                    stream_changed = False
+                    for name_str, og_key in name_to_objgen.items():
+                        if og_key in all_imgs:
+                            # 匹配 /<name> Do（可能有空格）
+                            pattern = re.compile(rf'/{re.escape(name_str)}\s+Do')
+                            if pattern.search(new_raw):
+                                new_raw = pattern.sub('', new_raw)
+                                deleted_count += 1
+                                stream_matched += 1
+                                stream_changed = True
+                                changed = True
+                    if stream_changed:
+                        try:
+                            # 写回解压后的内容（filter=None 表示无压缩）
+                            stream.write(new_raw.encode('latin-1'), filter=None)
+                        except Exception as e:
+                            self.log_signal.emit(f">>> Page {pidx+1} write err: {e}")
+                    page_matched_count += stream_matched
+
+                if changed:
+                    self.log_signal.emit(f">>> Page {pidx+1}: {page_matched_count} xref 匹配，删除 Do 引用")
+
+            self.log_signal.emit(f">>> 删除完成: {deleted_count} 个 Do 引用")
+
+            # 3. 保存到临时文件
+            # 输出路径：始终另存为新文件（不覆盖源文件）
+            self.progress.emit(90)
+            base, ext = os.path.splitext(self.file_path)
+            out_path = base + "_dpi" + ext
+            tmp_path = out_path + ".tmp"
+
+            try:
+                pdf.save(tmp_path, linearize=True)
+                pdf.close()
+                gc.collect()
+                time.sleep(0.3)
+                if os.path.exists(tmp_path):
+                    os.replace(tmp_path, out_path)
+                self.log_signal.emit(f">>> Saved: {out_path} ({os.path.getsize(out_path):,} bytes)")
+                self.progress.emit(100)
+                self.done.emit(out_path, "ok")
+            except Exception as e:
+                self.log_signal.emit(f">>> SAVE FAIL: {e}")
+                self.failed.emit(f"保存失败: {e}")
+
+        except Exception as ex:
+            import traceback
+            tb = traceback.format_exc()
+            self.log_signal.emit(f">>> ERROR: {ex}")
+            self.log_signal.emit(tb)
+            self.failed.emit(f"{ex}")
+
+
 # --- 4. 主程序窗口 ---
 class UltraAppFinal(QMainWindow):
     def __init__(self):
@@ -2118,6 +2973,10 @@ class UltraAppFinal(QMainWindow):
         self.lang = self.config.get("lang") or detect_system_lang()
         self.doc_orig = self.doc_clean = None
         self.display_lists = {}; self.file_path = ""
+        # _working_path: 当前所有去水印操作的工作基底文件路径。
+        # 首次加载 = file_path；每次去水印处理后更新为输出文件路径（实现叠加）；
+        # 保存后重置为 file_path（原文件已被覆盖，工作基底回到原文件）。
+        self._working_path = ""
         self.ratio_threshold = self.config.get("ratio", 30)
         self.extra_keywords = list(self.config.get("keywords", []))
         self.worker = None
@@ -2127,6 +2986,14 @@ class UltraAppFinal(QMainWindow):
         self._sb_guard = False       # 滚动条联动防递归
         self._rb_start = None        # 矩形框放大起点
         self._rubber = None
+        # 图像层水印去除（P4：整页位图里的红色广告水印）
+        self.imgwm_worker = None
+        self.imgwm_mode = "color_inpaint"  # color | color_inpaint | color_blur
+        self.imgwm_threshold = 6
+        # 按 DPI 去水印（P5）：选图模式 + 用户确认
+        self.dpiwm_worker = None
+        self._dpi_select_mode = False  # True = 左侧预览进入"选图"模式
+        self._dpi_selected_xref = None  # 用户选中的图片 xref
 
         self.scale = QApplication.primaryScreen().logicalDotsPerInch() / 96.0
         self.init_ui(); self.setAcceptDrops(True)
@@ -2149,6 +3016,8 @@ class UltraAppFinal(QMainWindow):
         act_exit.triggered.connect(self.close)
 
         self.btn_open = QPushButton(); self.btn_clean = QPushButton()
+        self.btn_imgwm = QPushButton(); self.btn_imgwm.setEnabled(False)
+        self.btn_dpiwm = QPushButton(); self.btn_dpiwm.setEnabled(False)
         self.btn_save = QPushButton(); self.btn_save.setEnabled(False)
         self.btn_save_as = QPushButton(); self.btn_save_as.setEnabled(False)
         self.btn_cancel = QPushButton(); self.btn_cancel.setEnabled(False)
@@ -2174,7 +3043,7 @@ class UltraAppFinal(QMainWindow):
                 self.log_file_handle = None
         self.log_errors_only = False
 
-        for b in [self.btn_open, self.btn_clean, self.btn_save, self.btn_save_as, self.btn_cancel, self.btn_settings]:
+        for b in [self.btn_open, self.btn_clean, self.btn_imgwm, self.btn_dpiwm, self.btn_save, self.btn_save_as, self.btn_cancel, self.btn_settings]:
             b.setFixedHeight(int(42 * self.scale)); sidebar.addWidget(b)
         sidebar.addWidget(self.log_output, 1)
         # 日志工具行
@@ -2207,12 +3076,28 @@ class UltraAppFinal(QMainWindow):
             l.setAlignment(Qt.AlignmentFlag.AlignCenter)
             l.setWordWrap(True)
             l.setMinimumSize(int(180 * self.scale), int(80 * self.scale))
+            l.setMouseTracking(True)   # 让 MouseMove 在按住鼠标时也能触发（tooltip 跟随）
             s.setWidget(l)
             s.setWidgetResizable(True)  # 空状态撑满视口，占位文字居中可见
             s.setAlignment(Qt.AlignmentFlag.AlignCenter)
             s.installEventFilter(self)
             l.installEventFilter(self)   # 支持左键拖框放大
         comp.addWidget(self.scroll_orig); comp.addWidget(self.scroll_clean)
+        # DPI 选图模式下的鼠标跟随提示：绝对定位在左侧预览上方，鼠标移出即隐藏
+        self._dpi_hover_tip = QLabel(self)
+        self._dpi_hover_tip.setText("点击水印选择图片")
+        self._dpi_hover_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dpi_hover_tip.setStyleSheet(
+            "QLabel { background: rgba(16, 24, 40, 235); color: white; "
+            "border: 1px solid #4a9eff; border-radius: 6px; "
+            "padding: 6px 12px; font-size: 13px; }"
+        )
+        self._dpi_hover_tip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._dpi_hover_tip.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._dpi_hover_tip.setFixedHeight(int(30 * self.scale))
+        self._dpi_hover_tip.adjustSize()
+        self._dpi_hover_tip.raise_()
+        self._dpi_hover_tip.hide()
         # 页码滚动条：适合页面模式下显示，值=页码（拉到最底=最后一页）
         preview_row = QHBoxLayout()
         preview_row.addLayout(comp)
@@ -2224,6 +3109,8 @@ class UltraAppFinal(QMainWindow):
         layout.addLayout(sidebar, 1); layout.addLayout(viewer, 4)
         self.btn_open.clicked.connect(self.load_file_dialog)
         self.btn_clean.clicked.connect(self.start_task)
+        self.btn_imgwm.clicked.connect(self.start_image_wm)
+        self.btn_dpiwm.clicked.connect(self.start_dpi_wm)
         self.btn_save.clicked.connect(self.save_pdf_inplace)
         self.btn_save_as.clicked.connect(self.save_as_pdf)
         self.btn_cancel.clicked.connect(self.stop_task)
@@ -2240,6 +3127,8 @@ class UltraAppFinal(QMainWindow):
         self.setWindowTitle(t["title"])
         self.btn_open.setText(t["open"])
         self.btn_clean.setText(t["clean"])
+        self.btn_imgwm.setText(t["img_wm"])
+        self.btn_dpiwm.setText(t["dpi_wm"])
         self.btn_save.setText(t["save"])
         self.btn_save_as.setText(t["save_as"])
         self.btn_cancel.setText(t["cancel"])
@@ -2354,7 +3243,39 @@ class UltraAppFinal(QMainWindow):
 
     def eventFilter(self, source, event):
         et = event.type()
-        # --- 左键拖框放大 ---
+        # --- 选图模式：在左侧预览点击 = 选中图片（点而不是拖框） ---
+        if self._dpi_select_mode and source in (self.lab_orig, self.lab_clean):
+            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                # 记录起点，release 时判断是否为"点击"
+                self._dpi_click_start = event.position().toPoint()
+                return True
+            if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                if getattr(self, '_dpi_click_start', None) is not None:
+                    start = self._dpi_click_start
+                    end = event.position().toPoint()
+                    dx = abs(end.x() - start.x())
+                    dy = abs(end.y() - start.y())
+                    self._dpi_click_start = None
+                    # 移动 <8 像素视为"点击"，否则视为"拖动"（忽略，让用户拖框放大）
+                    if dx < 8 and dy < 8:
+                        self._dpi_select_at(source, start)
+                    return True
+        # --- 选图模式：鼠标进入预览区域显示提示、移出隐藏、移动时跟随 ---
+        if self._dpi_select_mode and source in (self.lab_orig, self.lab_clean):
+            if et == QEvent.Type.Enter:
+                self._dpi_hover_tip.show()
+                self._dpi_hover_tip.raise_()
+            elif et == QEvent.Type.Leave:
+                self._dpi_hover_tip.hide()
+            elif et == QEvent.Type.MouseMove:
+                gp = event.globalPosition().toPoint()
+                if self._dpi_hover_tip.isVisible():
+                    # move() 取父控件本地坐标，需从全局坐标转换
+                    lp = self.mapFromGlobal(gp)
+                    self._dpi_hover_tip.move(lp.x() + 16, lp.y() + 18)
+                    self._dpi_hover_tip.raise_()
+            return False  # 不拦截，保留滚动等正常行为
+        # --- 左键拖框放大（非选图模式） ---
         if source in (self.lab_orig, self.lab_clean):
             if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._rb_start = event.position().toPoint()
@@ -2505,6 +3426,219 @@ class UltraAppFinal(QMainWindow):
         vsb.setValue(int(cy * self.zoom - vh / 2))
         self._sync_scroll_views(scroll)
 
+    def _dpi_select_at(self, source, pt):
+        """选图模式：点击坐标 → PDF 坐标 → 找命中的图片 → 弹出确认对话框。
+
+        pt: QLabel 内的像素坐标（左上角基准）。
+        命中判定：点击点位于该图片的渲染矩形内。若有多个重叠，取面积最小的（最上层）。
+        """
+        doc = self.doc_orig if source is self.lab_orig else self.doc_clean
+        if doc is None:
+            return
+        idx = self.page_spin.value() - 1
+        if idx < 0 or idx >= doc.page_count:
+            return
+        page = doc[idx]
+        lw, lh = source.width(), source.height()
+        if lw <= 0 or lh <= 0:
+            return
+        # 像素 → PDF 坐标
+        px = page.rect.width * pt.x() / lw
+        py = page.rect.height * pt.y() / lh
+        point = fitz.Point(px, py)
+
+        # 遍历该页所有图片，找命中的
+        hits = []
+        for entry in page.get_images(full=True):
+            xref = entry[0]
+            w, h = entry[2], entry[3]
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                continue
+            for r in rects:
+                if r.contains(point):
+                    hits.append({
+                        'xref': xref, 'w': w, 'h': h,
+                        'smask': entry[1],
+                        'rect': r,
+                        'area': r.width * r.height,
+                        'dpi': round(w * 72.0 / max(r.width, 1), 1),
+                        'dpi_y': round(h * 72.0 / max(r.height, 1), 1),
+                    })
+        if not hits:
+            self.add_log(f">>> 未命中任何图片（点 ({px:.1f},{py:.1f})）")
+            QMessageBox.information(self, "选图", "点击位置没有图片。请点到水印上再试。")
+            return
+        # 取面积最小的（最上层，最可能是水印）
+        target = min(hits, key=lambda x: x['area'])
+        self._dpi_selected_xref = target['xref']
+        self.add_log(
+            f">>> 选中图片: xref={target['xref']} {target['w']}x{target['h']} "
+            f"DPI={target['dpi']} 面积={target['area']:.0f} "
+            f"(共命中 {len(hits)} 张重叠图)"
+        )
+
+        # 弹确认框：让用户选匹配策略 + 删除范围
+        _dbg('dpi_select_at 命中 %d 张, target xref=%s, 构造 DpiMatchDialog...', len(hits), target.get('xref'))
+        dlg = DpiMatchDialog(self, target, hits_count=len(hits), scale=self.scale, doc=doc, page_idx=idx)
+        _dbg('dpi_select_at DpiMatchDialog 构造完成, 调用 exec()...')
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            _dbg('dpi_select_at 用户取消')
+            self._dpi_selected_xref = None
+            self._dpi_select_mode = False
+            self._dpi_hover_tip.hide()
+            self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+            return
+        _dbg('dpi_select_at 用户确认, get_match_mode...')
+        match = dlg.get_match_mode()  # "dpi" or "size"
+        scope = dlg.get_scope()       # "all" or "page"
+        _dbg('dpi_select_at match=%s, scope=%s', match, scope)
+        # 关闭选图模式
+        self._dpi_select_mode = False
+        self._dpi_hover_tip.hide()
+        self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+
+        # 扫描全 PDF 找匹配的图片
+        self.add_log(f">>> 开始扫描匹配 (mode={match}, scope={scope})...")
+        candidates = self._dpi_find_matches(target, match, scope)
+        if not candidates:
+            self.add_log(f">>> 未找到匹配图片")
+            QMessageBox.information(self, "无匹配", "未找到匹配的图片。")
+            return
+
+        self.add_log(f">>> 找到 {len(candidates)} 张匹配图片")
+        # 弹最终确认
+        confirm = QMessageBox.question(
+            self, "确认删除",
+            f"将删除 {len(candidates)} 张图片水印。\n\n"
+            f"参考图: {target['w']}x{target['h']} DPI={target['dpi']}\n"
+            f"匹配策略: {match}\n"
+            f"范围: {scope}\n\n"
+            f"是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self.add_log(f">>> 用户取消删除")
+            return
+
+        # 启动后台删除
+        self.pbar.setValue(0)
+        self.btn_dpiwm.setEnabled(False)
+        self.dpiwm_worker = DpiWmWorker(self._working_path, [c['xref'] for c in candidates], self)
+        self.dpiwm_worker.progress.connect(self.pbar.setValue)
+        self.dpiwm_worker.log_signal.connect(self.add_log)
+        self.dpiwm_worker.done.connect(self._dpiwm_finished)
+        self.dpiwm_worker.failed.connect(self._dpiwm_failed)
+        self.dpiwm_worker.start()
+
+    def _dpi_find_matches(self, target, match_mode, scope):
+        """扫描全 PDF，找出匹配 DPI 或尺寸的图片。
+
+        match_mode:
+          - "dpi": 按 DPI 匹配（默认 ±20 允许差）
+          - "size": 按精确尺寸匹配
+        scope:
+          - "all": 全 PDF
+          - "page": 只当前页
+        返回: [{'xref', 'page', 'w', 'h', 'dpi'}, ...]
+
+        扫描当前工作状态（doc_clean 优先），确保 xref 与 _working_path 一致。
+        """
+        scan_doc = self.doc_clean if self.doc_clean else self.doc_orig
+        if scan_doc is None:
+            return []
+        tw, th = target['w'], target['h']
+        tdpi = target['dpi']
+        results = []
+        page_start = 0 if scope == "all" else (self.page_spin.value() - 1)
+        page_end = scan_doc.page_count if scope == "all" else (page_start + 1)
+
+        for pidx in range(page_start, page_end):
+            page = scan_doc[pidx]
+            for entry in page.get_images(full=True):
+                xref, _, w, h, *_ = entry
+                try:
+                    rects = page.get_image_rects(xref)
+                    if not rects:
+                        continue
+                    r = rects[0]
+                    dpi = round(w * 72.0 / max(r.width, 1), 1)
+                except Exception:
+                    continue
+                # 匹配判定
+                if match_mode == "size":
+                    if (w, h) != (tw, th):
+                        continue
+                else:  # dpi
+                    if abs(dpi - tdpi) > 20:
+                        continue
+                results.append({
+                    'xref': xref, 'page': pidx, 'w': w, 'h': h, 'dpi': dpi,
+                })
+        return results
+
+    def _dpiwm_finished(self, out_path, status):
+        """按 DPI 去水印完成回调。
+
+        左侧预览保持原版（doc_orig 不动），直到用户点"保存"才更新。
+        右侧预览显示处理结果（doc_clean = 处理结果）。
+        叠加：_working_path 更新为 out_path，下次去水印基于此文件。
+        """
+        self.btn_dpiwm.setEnabled(True)
+        self.add_log(f">>> 按 DPI 去水印完成: {out_path}")
+        try:
+            if self.doc_clean is not None:
+                try: self.doc_clean.close()
+                except Exception: pass
+            self.doc_clean = fitz.open(out_path)
+            self._working_path = out_path
+            self.btn_save.setEnabled(True)
+            self.btn_save_as.setEnabled(True)
+            self._pending_path = out_path
+            self.update_previews()
+        except Exception as e:
+            self.log_exception(e, "_dpiwm_finished open")
+            self.add_log(f">>> 打开处理结果失败: {e}")
+
+    def _dpiwm_failed(self, err):
+        self.btn_dpiwm.setEnabled(True)
+        self.add_log(f">>> 按 DPI 去水印失败: {err}")
+        try:
+            QMessageBox.critical(self, "处理失败", str(err))
+        except Exception:
+            pass
+
+    def start_dpi_wm(self):
+        """🎯 按 DPI 去水印：进入选图模式，用户在预览里点击水印图片。"""
+        if not self.file_path or not os.path.isfile(self.file_path):
+            QMessageBox.warning(self, "无法处理", "请先打开一个 PDF 文件")
+            return
+        if self.dpiwm_worker is not None and self.dpiwm_worker.isRunning():
+            self.add_log(f">>> 按 DPI 去水印进行中")
+            return
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "等待中", "结构层清理还在进行")
+            return
+        if not self.doc_orig:
+            QMessageBox.warning(self, "无法处理", "请先打开一个 PDF 文件")
+            return
+
+        # 切换选图模式（再点一次则退出）
+        if self._dpi_select_mode:
+            self._dpi_select_mode = False
+            self._dpi_selected_xref = None
+            self._dpi_hover_tip.hide()
+            self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+            self.add_log(f">>> 退出选图模式")
+            return
+
+        self._dpi_select_mode = True
+        self._dpi_selected_xref = None
+        self.btn_dpiwm.setText("🎯 点击选择水印图片")
+        # tooltip 不在此处显示，等鼠标移入预览区域时由 eventFilter 自动显示
+        self.add_log(f">>> 进入选图模式：请在左侧预览里【点击】一张水印图片。按 Esc 或再点本按钮可退出。")
+
     def update_previews(self):
         if not self.doc_orig:
             return
@@ -2537,7 +3671,7 @@ class UltraAppFinal(QMainWindow):
                 scroll.setWidgetResizable(False)
                 z = compute_zoom(doc, scroll)
                 pix = doc[idx].get_pixmap(matrix=fitz.Matrix(z, z))
-                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
                 lab.setPixmap(QPixmap.fromImage(qimg))
                 lab.setFixedSize(pix.width, pix.height)  # 尺寸超过视口时滚动条出现
                 if self.fit_mode != "custom":
@@ -2547,6 +3681,12 @@ class UltraAppFinal(QMainWindow):
         render_to_label(self.doc_orig, self.lab_orig, self.scroll_orig)
         if self.doc_clean:
             render_to_label(self.doc_clean, self.lab_clean, self.scroll_clean)
+        else:
+            # 右侧无处理结果时清空，避免残留上次 PDF 的图片
+            self.lab_clean.clear()
+            self.lab_clean.setPixmap(QPixmap())
+            self.lab_clean.setFixedSize(self.scroll_clean.viewport().width(), self.scroll_clean.viewport().height())
+            self.lab_clean.setText("（未处理）")
 
     def _update_recent(self, path):
         rec = [p for p in self.config.get("recent_files", []) if p != path]
@@ -2563,6 +3703,17 @@ class UltraAppFinal(QMainWindow):
         if not path or not os.path.isfile(path):
             self.add_log(f"File not found: {path}")
             return False
+        # 关闭旧文档，避免文件句柄泄漏（Windows 上尤其重要）
+        for attr in ("doc_orig", "doc_clean"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        import gc
+        gc.collect()
         try:
             self.doc_orig = fitz.open(path)
         except Exception as ex:
@@ -2570,7 +3721,11 @@ class UltraAppFinal(QMainWindow):
             return False
         self.file_path = path
         self.display_lists = {}; self.doc_clean = None
+        self._working_path = path  # 工作基底 = 原文件（去水印叠加的起点）
         self.btn_save.setEnabled(False)
+        self.btn_save_as.setEnabled(False)
+        self.btn_imgwm.setEnabled(bool(self.doc_orig))
+        self.btn_dpiwm.setEnabled(bool(self.doc_orig))
         self.page_spin.setRange(1, len(self.doc_orig)); self.page_spin.setValue(1)
         self.add_log(f"File loaded: {os.path.basename(path)} ({len(self.doc_orig)} pages, {os.path.getsize(path):,} bytes)")
         self._update_recent(path)
@@ -2611,24 +3766,113 @@ class UltraAppFinal(QMainWindow):
 
     def start_task(self):
         if not self.doc_orig:
+            QMessageBox.warning(self, "无法处理", "请先打开一个 PDF 文件")
             return
         if self.worker is not None and self.worker.isRunning():
-            self.add_log(">>> " + TRANSLATIONS[self.lang]["analyzing"])
+            QMessageBox.information(self, "等待中", "结构层清理还在进行，请稍候")
             return
+
         self.pbar.setValue(0)
         self.btn_clean.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         files = self.batch_files if len(self.batch_files) > 1 else [self.file_path]
-        self.worker = MasterWorker(files[0], self.ratio_threshold)
-        self.worker.batch_files = files if len(files) > 1 else []
-        self.worker.extra_keywords = list(self.extra_keywords)
-        self.worker.progress.connect(self.pbar.setValue)
-        self.worker.log_signal.connect(self.add_log)
-        self.worker.need_confirm.connect(self.ask_user)
-        self.worker.finished.connect(self.task_done)
-        self.worker.failed.connect(lambda: (self.btn_clean.setEnabled(True),
-                                            self.btn_cancel.setEnabled(False)))
-        self.worker.start()
+        try:
+            self.worker = MasterWorker(files[0], self.ratio_threshold)
+            self.worker.batch_files = files if len(files) > 1 else []
+            self.worker.extra_keywords = list(self.extra_keywords)
+            self.worker.progress.connect(self.pbar.setValue)
+            self.worker.log_signal.connect(self.add_log)
+            self.worker.need_confirm.connect(self.ask_user)
+            self.worker.done.connect(self.task_done)
+            self.worker.failed.connect(lambda: (self.btn_clean.setEnabled(True),
+                                                self.btn_cancel.setEnabled(False)))
+            self.worker.start()
+        except Exception as e:
+            self.btn_clean.setEnabled(True)
+            self.btn_cancel.setEnabled(False)
+            self.log_exception(e, "start_task")
+
+    def start_image_wm(self):
+        """🎨 去除图像水印：先扫描 PDF 所有图像 → 让用户选参数 → 后台处理"""
+        _dbg('start_image_wm ENTER')
+        if not self.file_path or not os.path.isfile(self.file_path):
+            QMessageBox.warning(self, "无法处理", "请先打开一个 PDF 文件")
+            return
+        if self.imgwm_worker is not None and self.imgwm_worker.isRunning():
+            self.add_log(">>> 图像水印处理进行中，请稍候")
+            return
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "等待中", "结构层清理还在进行，请稍候")
+            return
+
+        self.pbar.setValue(0)
+        self.btn_imgwm.setEnabled(False)
+        self.add_log(f">>> 图像水印处理启动: {os.path.basename(self._working_path)}")
+        _dbg('image_wm 启动完成, working=%s, doc_orig=%s', self._working_path, self.doc_orig is not None)
+
+        # 弹出对话框让用户选参数（默认用上次保存的 channel/fill/threshold）
+        _dbg('image_wm 弹出对话框...')
+        try:
+            prev_channel, prev_fill = self.imgwm_mode.split("_", 1) if "_" in self.imgwm_mode else ("sat", self.imgwm_mode)
+        except Exception:
+            prev_channel, prev_fill = "sat", "inpaint"
+        _dbg('image_wm 构造 ImageWmDialog (channel=%s, fill=%s, threshold=%s)', prev_channel, prev_fill, self.imgwm_threshold)
+        dlg = ImageWmDialog(self, current_channel=prev_channel, current_fill=prev_fill, current_threshold=self.imgwm_threshold, scale=self.scale)
+        _dbg('image_wm ImageWmDialog 构造完成, 调用 exec()...')
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            _dbg('image_wm 用户取消')
+            self.add_log(">>> 用户取消图像水印处理")
+            self.btn_imgwm.setEnabled(True)
+            return
+        _dbg('image_wm 用户确认, 获取设置...')
+        settings = dlg.get_settings()
+        _dbg('image_wm settings=%s', settings)
+        self.imgwm_mode = f"{settings['channel']}_{settings['fill']}"
+        self.imgwm_threshold = settings['threshold']
+        self.add_log(f">>> 参数: channel={settings['channel']}, fill={settings['fill']}, threshold={settings['threshold']}")
+
+        _dbg('image_wm 创建 ImageWmWorker...')
+        self.imgwm_worker = ImageWmWorker(self._working_path, settings, self)
+        _dbg('image_wm ImageWmWorker 创建完成, 连接信号...')
+        self.imgwm_worker.progress.connect(self.pbar.setValue)
+        self.imgwm_worker.log_signal.connect(self.add_log)
+        self.imgwm_worker.done.connect(self._imgwm_finished)
+        self.imgwm_worker.failed.connect(self._imgwm_failed)
+        _dbg('image_wm 信号连接完成, 调用 start()...')
+        self.imgwm_worker.start()
+        _dbg('image_wm Worker start() 完成, isRunning=%s', self.imgwm_worker.isRunning())
+
+    def _imgwm_finished(self, out_path, status):
+        """图像水印处理完成回调。
+
+        左侧预览保持原版（doc_orig 不动），直到用户点"保存"才更新。
+        右侧预览显示处理结果（doc_clean = 处理结果）。
+        叠加：_working_path 更新为 out_path，下次去水印基于此文件。
+        """
+        self.btn_imgwm.setEnabled(True)
+        self.add_log(f">>> 图像水印处理完成: {out_path}")
+        try:
+            if self.doc_clean is not None:
+                try: self.doc_clean.close()
+                except Exception: pass
+            self.doc_clean = fitz.open(out_path)
+            self._working_path = out_path
+            self.btn_save.setEnabled(True)
+            self.btn_save_as.setEnabled(True)
+            self._pending_path = out_path
+            self.update_previews()
+        except Exception as e:
+            self.log_exception(e, "_imgwm_finished open")
+            self.add_log(f">>> 打开处理结果失败: {e}")
+
+    def _imgwm_failed(self, err):
+        """图像水印处理失败回调。"""
+        self.btn_imgwm.setEnabled(True)
+        self.add_log(f">>> 图像水印处理失败: {err}")
+        try:
+            QMessageBox.critical(self, "处理失败", str(err))
+        except Exception:
+            pass
 
     def stop_task(self):
         if self.worker is not None and self.worker.isRunning():
@@ -2682,15 +3926,30 @@ class UltraAppFinal(QMainWindow):
             self.log_exception(ex, "ask_user dialog error")
         self.worker.is_confirmed = True
 
-    def task_done(self, doc):
+    def task_done(self, doc, out_path):
+        """结构层去水印完成回调。
+
+        左侧预览保持原版（doc_orig 不动），直到用户点"保存"才更新。
+        右侧预览显示处理结果（doc_clean = 处理结果）。
+        叠加：_working_path 更新为 out_path，下次去水印基于此文件。
+        """
         self.btn_clean.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         if doc is None:
             return
-        self.doc_clean = doc
-        self.btn_save.setEnabled(True)
-        self.btn_save_as.setEnabled(True)
-        self.update_previews()
+        try:
+            if self.doc_clean is not None:
+                try: self.doc_clean.close()
+                except Exception: pass
+            self.doc_clean = doc
+            self._working_path = out_path or self.file_path
+            self.btn_save.setEnabled(True)
+            self.btn_save_as.setEnabled(True)
+            self._pending_path = out_path
+            self.update_previews()
+        except Exception as e:
+            self.log_exception(e, "task_done open")
+            self.add_log(f">>> 打开处理结果失败: {e}")
 
     def save_pdf_inplace(self):
         """保存：直接覆盖源文件（不改变文件名和路径）。
@@ -2765,8 +4024,17 @@ class UltraAppFinal(QMainWindow):
             return
 
         self.add_log(f"Saved (overwrite source): {src} ({os.path.getsize(src):,} bytes)")
-        # 4. 重新打开源文件，让预览区继续可用
-        self._reopen_clean(src)
+        # 4. 重新打开保存后的文件：两侧预览都显示"刚保存后的 PDF"，
+        #    工作基底重置为原文件路径（因为原文件已被覆盖为最新状态）
+        self.doc_orig = fitz.open(src)
+        self.doc_clean = fitz.open(src)
+        self._working_path = src
+        self.btn_save.setEnabled(True)
+        self.btn_save_as.setEnabled(True)
+        if hasattr(self, "page_spin"):
+            self.page_spin.setRange(1, len(self.doc_orig))
+            self.page_spin.setValue(1)
+        self.update_previews()
 
     def _reopen_orig(self, src):
         """重新打开源文件为 doc_orig，失败时静默。"""

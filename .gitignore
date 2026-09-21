@@ -3,7 +3,6 @@ __pycache__/
 build/
 build_ag/
 build_on/
-build_agent/
 dist/
 dist_dir/
 *.spec
@@ -17,3 +16,15 @@ _p0p3_extension.py
 analyze_2024.py
 analyze_rects.py
 remove_adobe_watermark.py
+# 临时诊断/测试脚本
+_diag_*.py
+_dump_*.py
+_e2e_*.py
+_find_*.py
+_probe_*.py
+_render_*.py
+_run_*.bat
+_smask_*.png
+_rgb_*.png
+_page3_*.png
+_test_*.py
