@@ -28,3 +28,5 @@ _smask_*.png
 _rgb_*.png
 _page3_*.png
 _test_*.py
+*.bak*
+_btn_state_test.py

@@ -517,9 +517,10 @@ def _process_form_children(res, m_total, targets):
     return total
 
 
-def locate_text_instances(path, text, size=None, rot=None, pages=None):
+def locate_text_instances(path, text, size=None, rot=None, pages=None, color=None):
     """用 PyMuPDF 在页面上定位候选文本的所有实例位置（可解码 CID）。
-    返回 {页索引: [(bbox...), ...]}，只匹配文本相同且 size 接近的实例。"""
+    返回 {页索引: [(bbox...), ...]}，只匹配文本相同且 size 接近的实例；
+    若提供 color，则额外按颜色过滤。"""
     try:
         import pymupdf as _f
     except ImportError:
@@ -554,6 +555,15 @@ def locate_text_instances(path, text, size=None, rot=None, pages=None):
                         continue
                     if size and abs(sz - size) > max(2.0, size * 0.25):
                         continue
+                    if color is not None:
+                        col_i = int(col or 0)
+                        want_i = int(color)
+                        # 32-bit color with alpha: compare only RGB
+                        if want_i & 0x00FF0000 and (col_i & 0x00FF0000):
+                            if (col_i & 0x00FFFFFF) != (want_i & 0x00FFFFFF):
+                                continue
+                        elif col_i != want_i:
+                            continue
                     hits.append((bb[0], bb[1], bb[2], bb[3]))
         if hits:
             out[pno] = hits

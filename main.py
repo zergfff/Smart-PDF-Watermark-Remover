@@ -238,7 +238,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QPushButton, QVBoxLayout
                              QWidget, QFileDialog, QLabel, QProgressBar, QMessageBox, QTextEdit,
                              QDialog, QCheckBox, QScrollArea, QFrame, QSpinBox, QLineEdit, QComboBox,
                              QMenu, QScrollBar, QRubberBand, QRadioButton, QButtonGroup, QSlider)
-from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette, QTransform
+from PyQt6.QtGui import QPixmap, QImage, QTextCursor, QPainter, QPen, QColor, QPalette, QTransform, QBrush
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QSize, QRect, QPoint, QRectF
 
 # --- 环境适配 ---
@@ -268,6 +268,7 @@ TRANSLATIONS = {
         "clean": "⚡ 元素水印",
         "img_wm": "🎨 色彩水印",
         "dpi_wm": "🎯 图像水印",
+        "dpi_wm_select": "🎯 点击选择水印图片",
         "save": "💾 保存",
         "save_as": "💾 另存为",
         "settings": "⚙️ 设置",
@@ -344,6 +345,7 @@ TRANSLATIONS = {
         "clean": "⚡ Element Watermark",
         "img_wm": "🎨 Color Watermark",
         "dpi_wm": "🎯 Image Watermark",
+        "dpi_wm_select": "🎯 Click a watermark image",
         "save": "💾 Save",
         "save_as": "💾 Save As",
         "settings": "⚙️ Settings",
@@ -563,7 +565,7 @@ def analyze_page(fitz, doc, i):
         except Exception as e:
             page_data.setdefault('_errs', []).append(f"Page {i} image error: {e}")
             continue
-    blocks = page.get_text("rawdict")["blocks"]
+    blocks = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for b in blocks:
         if b["type"] != 0: continue
         for line in b["lines"]:
@@ -574,7 +576,8 @@ def analyze_page(fitz, doc, i):
                 if not txt:
                     continue
                 sz = round(sp.get("size", 0), 1)
-                if merged and merged[-1][0] == sz and abs(merged[-1][3] - (sp.get("bbox") or [0,0,0,0])[1]) < 2:
+                sp_color = sp.get("color")
+                if merged and merged[-1][0] == sz and merged[-1][3] == sp_color and abs(merged[-1][4] - (sp.get("bbox") or [0,0,0,0])[1]) < 2:
                     merged[-1][1] += txt
                     b0 = merged[-1][2]
                     b1 = sp.get("bbox") or [0, 0, 0, 0]
@@ -582,14 +585,15 @@ def analyze_page(fitz, doc, i):
                                      max(b0[2], b1[2]), max(b0[3], b1[3]))
                 else:
                     b = sp.get("bbox") or (0, 0, 0, 0)
-                    merged.append([sz, txt, tuple(round(v, 1) for v in b), (b[1] if isinstance(b, (list, tuple)) else 0)])
-            for sz, content, bbox, _y0 in merged:
-                if len(content) <= 1:
+                    merged.append([sz, txt, tuple(round(v, 1) for v in b), sp_color, (b[1] if isinstance(b, (list, tuple)) else 0)])
+            for sz, content, bbox, sp_color, _y0 in merged:
+                # 单字符文本不在这里丢弃：水印可能是「-」「+」等单字符，
+                # 统一交给分组阶段按“字号是否显著大于正文”过滤。
+                if not content:
                     continue
                 size = sz
                 origin = None
                 rot = 0.0
-                color = None
                 for sp in spans:
                     chs = sp.get("chars") or []
                     if chs and chs[0].get("origin"):
@@ -597,13 +601,11 @@ def analyze_page(fitz, doc, i):
                     if len(chs) >= 2 and chs[0].get("origin") and chs[1].get("origin"):
                         o0, o1 = chs[0]["origin"], chs[1]["origin"]
                         rot = round(math.degrees(math.atan2(o1[1] - o0[1], o1[0] - o0[0])), 1)
-                    if sp.get('color'):
-                        color = sp['color']
                     if origin is not None:
                         break
                 page_data['texts'].append({'text': content, 'bbox': bbox,
                                            'size': size, 'origin': origin,
-                                           'rot': rot, 'color': color})
+                                           'rot': rot, 'color': sp_color})
     return page_data
 
 
@@ -994,31 +996,25 @@ class EnhancedWatermarkDialog(QDialog):
                 _ih = int(info.get('h') or 0)
                 lab = None
                 try:
-                    # 全页扫描底图（如 3840×2160）解码会冻死 UI 线程，只显示尺寸占位
-                    if _iw * _ih > 400 * 400:
-                        lab = QLabel(f"{_iw}×{_ih} px\n(preview skipped)")
-                        lab.setStyleSheet("color:#888; font-size:9pt;")
-                    else:
-                        pix = fitz.Pixmap(self.doc, info['xref'])
-                        if pix.n not in (1, 3, 4):
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        if pix.width > 400 or pix.height > 400:
-                            try:
-                                zoom = min(400 / pix.width, 400 / pix.height)
-                                pix.scale(zoom, zoom)
-                            except Exception:
-                                pass
-                        fmt = QImage.Format.Format_RGB888 if pix.n == 3 else (
-                            QImage.Format.Format_RGBA8888 if pix.n == 4 else QImage.Format.Format_Grayscale8
-                        )
-                        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
-                        lab = QLabel()
-                        lab._hi = qimg.copy()  # 原始高清(供悬停放大)
-                        lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-                        if pix.n and pix.width:
-                            _lum = sum(pix.samples[::pix.n]) / float(max(1, len(pix.samples) // pix.n))
-                            if _lum >= 235:
-                                lab.setStyleSheet("background:#808080;")
+                    pix = fitz.Pixmap(self.doc, info['xref'])
+                    if pix.n not in (1, 3, 4):
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    # 预览上限 400x400：大图直接缩放，不再跳过
+                    max_preview = 400
+                    if pix.width > max_preview or pix.height > max_preview:
+                        zoom = min(max_preview / pix.width, max_preview / pix.height)
+                        pix = fitz.Pixmap(pix, int(pix.width * zoom), int(pix.height * zoom))
+                    fmt = QImage.Format.Format_RGB888 if pix.n == 3 else (
+                        QImage.Format.Format_RGBA8888 if pix.n == 4 else QImage.Format.Format_Grayscale8
+                    )
+                    qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
+                    lab = QLabel()
+                    lab._hi = qimg.copy()  # 原始高清(供悬停放大)
+                    lab.setPixmap(QPixmap.fromImage(qimg).scaled(int(150*scale), int(80*scale), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                    if pix.n and pix.width:
+                        _lum = sum(pix.samples[::pix.n]) / float(max(1, len(pix.samples) // pix.n))
+                        if _lum >= 235:
+                            lab.setStyleSheet("background:#808080;")
                 except Exception as e:
                     # 预览失败也要保留可勾选条目，避免候选静默消失
                     print(f"Error loading img preview: {e}")
@@ -1179,6 +1175,8 @@ class EnhancedWatermarkDialog(QDialog):
                 row_layout.addWidget(QLabel(f"<span style='{TXT_STAT_STYLE}'>{self.t['count']}: {info['count']}</span>"))
                 self.text_line_boxes.append({'checkbox': cb, 'content': key[0], 'bbox': info.get('bbox', (0, 0, 0, 0)), 'size': key[1],
                                              'origin': info.get('origin'), 'rot': info.get('rot', 0.0),
+                                             'color': info.get('color'),
+                                             'pages': info.get('pages') or [info.get('sample_page')],
                                              'origins': info.get('origins') or []})
                 self.text_cards.append((frame, key[0].lower()))
                 self.scroll_layout.addWidget(frame)
@@ -1270,7 +1268,7 @@ class EnhancedWatermarkDialog(QDialog):
                 want_color = self._hover_color
                 want_rot = self._hover_rot
                 out = []
-                blocks = page.get_text("rawdict")["blocks"]
+                blocks = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
                 for b in blocks:
                     if b["type"] != 0:
                         continue
@@ -1533,6 +1531,8 @@ class EnhancedWatermarkDialog(QDialog):
         imgs = [h for h, cb in self.img_boxes.items() if cb.isChecked()]
         txts = [{'text': i['content'], 'bbox': i['bbox'], 'size': i['size'],
                  'origin': i.get('origin'), 'rot': i.get('rot', 0.0),
+                 'color': i.get('color'),
+                 'pages': i.get('pages') or [],
                  'origins': i.get('origins') or []}
                 for i in self.text_line_boxes if i['checkbox'].isChecked()]
         return {
@@ -1834,6 +1834,8 @@ class MasterWorker(QThread):
         self.log_signal.emit(">>> Starting analysis...")
         doc = fitz.open(fpath)
         total = len(doc)
+        doc.close()  # 提前关闭，释放内存；扫描线程各自 open
+        import gc; gc.collect()
         cpu_count = max(1, (os.cpu_count() or 4) - 1)
         chunk_size = max(1, total // cpu_count)
         ranges = [list(range(i, min(i + chunk_size, total))) for i in range(0, total, chunk_size)]
@@ -1846,7 +1848,6 @@ class MasterWorker(QThread):
         page_list = list(range(total))
         for base in range(0, total, SCAN_BATCH):
             if self.stop_flag:
-                doc.close()
                 return None
             batch = page_list[base:base + SCAN_BATCH]
             try:
@@ -1873,6 +1874,16 @@ class MasterWorker(QThread):
             group_count = len(pages)
             # ratio_threshold 已在 __init__ 除过 100，这里不要再 /100
             threshold = max(2, int(group_count * self.ratio_threshold))
+            # 组内主流字号（按出现次数），用于过滤正文里的单字符（. - 1 等）
+            _size_hist = {}
+            for p in pages:
+                for _t in p['texts']:
+                    try:
+                        _s = round(float(_t.get('size') or 0.0), 1)
+                    except Exception:
+                        continue
+                    _size_hist[_s] = _size_hist.get(_s, 0) + 1
+            dominant_size = max(_size_hist.items(), key=lambda kv: kv[1])[0] if _size_hist else 0.0
             img_counts = {}; txt_counts = {}
             for p in pages:
                 unique_hashes = set(img['hash'] for img in p['imgs'])
@@ -1893,6 +1904,15 @@ class MasterWorker(QThread):
                         }
                     final_img_candidates[h]['xrefs'].add(img['xref'])
                 for t in p['texts']:
+                    _txt = str(t.get('text') or '')
+                    if len(_txt) <= 1:
+                        # 单字符候选：只有字号显著大于正文主流字号才保留
+                        try:
+                            _tsize = float(t.get('size') or 0.0)
+                        except Exception:
+                            _tsize = 0.0
+                        if dominant_size and _tsize < dominant_size * 1.3:
+                            continue
                     # 尺寸+颜色+角度 严格一致才算同一候选；角度归一到最近 5°(避免 0.2° 舍入拆开)
                     rot_k = round(round(t.get('rot', 0.0) / 5.0) * 5.0, 1)
                     tk = (t['text'], t['size'], t.get('color'), rot_k, size_key)
@@ -2132,73 +2152,130 @@ class MasterWorker(QThread):
             tmp_imgs = os.path.join(tempfile.gettempdir(),
                                     f"__wm_imgs_{uuid.uuid4().hex}_{os.path.basename(fpath)}")
             doc.save(tmp_imgs, garbage=4, deflate=True)
+            try:
+                doc.close()
+            except Exception:
+                pass
             pdf = pikepdf.open(tmp_imgs)
-        doc.close()
+        else:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+        # Form XObject 拍平：不依赖页面上的 /Do，直接把页面级 Form 并入页面主内容流。
+        # 这样原先藏在 /Resources/XObject 里的文本/路径/图片都能被后续文本和几何删除看见。
+        if tc or confirmed_xrefs:
+            try:
+                from form_flatten import flatten_all_page_forms
+                flatten_n = flatten_all_page_forms(pdf)
+                if flatten_n:
+                    flatten_tmp = os.path.join(
+                        tempfile.gettempdir(),
+                        f"__wm_flat_{uuid.uuid4().hex}_{os.path.basename(fpath)}",
+                    )
+                    pdf.save(flatten_tmp)
+                    pdf.close()
+                    pdf = pikepdf.open(flatten_tmp)
+                    fpath = flatten_tmp
+                    self.log_signal.emit(f">>> Form XObject flattened: {flatten_n} page-level Form(s)")
+            except Exception as e:
+                self.log_signal.emit(f">>> Form XObject flatten failed: {e}")
 
         removed_total = 0
-        # 只有关键词（文本水印）非空才需要扫每页 Contents；否则整段可跳过。
-        # 对 319 页的扫描 PDF 这是最大节省：原每页都要 read_bytes + regex 21 秒。
-        if keywords:
-            for i, page in enumerate(pdf.pages):
-                if self.stop_flag:
+        # 文本水印删除：**只删内容流里的文本绘制操作符（Tj/TJ）**，CID 感知。
+        # 明文串与十六进制 CID 都会按字体 ToUnicode 解码后与候选文本比对，
+        # 命中才删除该操作符，其余内容（正文）一字节不动。
+        # 绝不使用 add_redact_annot / apply_redactions：旋转文本的轴对齐 bbox
+        # 会覆盖整页（实测 43%），红化会把框内正文一起删除。正文必须 100% 保留。
+        if tc:
+            try:
+                self.log_signal.emit(">>> Text watermark delete via content-stream text operators...")
+                self.progress.emit(30)
+                try:
+                    import text_stream_remover as _tsr
+                except Exception as _imp_err:
+                    _tsr = None
+                    self.log_signal.emit(f">>> text_stream_remover unavailable: {_imp_err}")
+                if _tsr is not None:
+                    # 保险丝：删除前后逐页统计正文字符数，实际损失远超预期即回滚
+                    def _page_char_counts(p):
+                        counts = []
+                        try:
+                            _d = fitz.open(p)
+                            for _pg in _d:
+                                counts.append(len(_pg.get_text()))
+                            _d.close()
+                        except Exception:
+                            counts = []
+                        return counts
+
+                    pre_counts = _page_char_counts(fpath)
+                    removed_ops, hits, unmatched, removed_chars = _tsr.remove_candidate_text(
+                        pdf, tc, log=self.log_signal.emit
+                    )
+                    removed_total = removed_ops
+                    self.log_signal.emit(
+                        f">>> Text watermark operators removed: {removed_ops} "
+                        f"(expected ~{removed_chars} chars; "
+                        f"{len(tc) - len(unmatched)}/{len(tc)} candidates matched)"
+                    )
+                    for u in (unmatched or [])[:10]:
+                        self.log_signal.emit(
+                            f">>> WARNING candidate not found in content stream, left untouched: {str(u)[:70]}"
+                        )
+                    # 落盘，后续步骤基于新工作副本
+                    base_tmp = os.path.join(
+                        tempfile.gettempdir(),
+                        f"__wm_txtstream_{uuid.uuid4().hex}_{os.path.basename(fpath)}",
+                    )
+                    pdf.save(base_tmp)
                     pdf.close()
-                    return None
-                n = _wm_process_page(pdf, page, keywords)
-                n += _wm_process_xobjects(page.get("/Resources"), keywords)
-                removed_total += n
-                self.progress.emit(30 + int((i + 1) / total * 30))
+
+                    # 保险丝校验
+                    post_counts = _page_char_counts(base_tmp)
+                    actual_loss = 0
+                    if pre_counts and len(pre_counts) == len(post_counts):
+                        actual_loss = sum(max(0, a - b) for a, b in zip(pre_counts, post_counts))
+                    allowed = removed_chars * 2 + 200
+                    if post_counts and actual_loss > allowed:
+                        self.log_signal.emit(
+                            f">>> ERROR text loss {actual_loss} chars exceeds expected "
+                            f"{removed_chars} (limit {allowed}) — REVERTED to keep original text"
+                        )
+                        try:
+                            os.remove(base_tmp)
+                        except Exception:
+                            pass
+                        removed_total = 0
+                    else:
+                        fpath = base_tmp
+                    pdf = pikepdf.open(fpath)
+                self.progress.emit(60)
+            except Exception as e:
+                self.log_signal.emit(f">>> Text watermark delete failed: {e}")
+                try:
+                    pdf = pikepdf.open(fpath)
+                except Exception:
+                    pass
         else:
-            self.log_signal.emit(">>> Text watermark skip: keywords empty (image-only mode).")
+            self.log_signal.emit(">>> Text watermark skip: no confirmed text candidates.")
             self.progress.emit(60)
-        # 几何签名删除（CID/特殊编码字体水印的关键词兜底）
+
         geo_removed = 0
-        import pymupdf as _lf
-        located = {}   # pno -> [(size, rot, cx, cy), ...]
+        geo_targets = []
+        # 保持变量以兼容后续日志与统计
+
+        # Form 兜底：用户勾选即删
+        form_removed = 0
         for c in tc:
             if not c.get('text'):
                 continue
-            size = c.get('size')
             try:
-                inst = _dw.locate_text_instances(fpath, c['text'], size,
-                                                 None, range(total))
+                form_removed += _dw.find_and_remove_form(pdf, fpath, c['text'])
             except Exception:
-                inst = {}
-            for pno, boxes in inst.items():
-                for (x0, y0, x1, y1) in boxes:
-                    located.setdefault(pno, []).append(
-                        (float(size or 10), float(c.get('rot', 0.0)),
-                         x0, (y0 + y1) / 2))
-        geo_targets = []
-        if located:
-            for page_idx, page in enumerate(pdf.pages):
-                if self.stop_flag:
-                    break
-                if page_idx in located:
-                    geo_removed += _dw.process_page_geo(pdf, page, located[page_idx])
-        else:
-            for c in tc:
-                if not c.get('size'):
-                    continue
-                origins = c.get('origins') or ([c['origin']] if c.get('origin') else [])
-                for o in origins:
-                    if o:
-                        geo_targets.append((float(c['size']), float(c.get('rot', 0.0)),
-                                            float(o[0]), float(o[1])))
-            if geo_targets:
-                for page in pdf.pages:
-                    if self.stop_flag:
-                        break
-                    geo_removed += _dw.process_page_geo(pdf, page, geo_targets)
-        # Form 兜底：用户勾选即删
-        form_removed = 0
-        if geo_removed == 0 and located:
-            for c in tc:
-                if not c.get('text'):
-                    continue
-                try:
-                    form_removed += _dw.find_and_remove_form(pdf, fpath, c['text'])
-                except Exception:
-                    pass
+                pass
+
         img_removed = 0
         if confirmed_xrefs:
             img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
@@ -2312,9 +2389,11 @@ class MasterWorker(QThread):
         left_imgs = []
         try:
             chk = fitz.open(out_path)
+            # 1 字符关键词（如 '-'）会命中正文里普通连字符 → 复检时跳过，避免假报残留
+            _resid_kw = [k for k in keywords if len(k) >= 2]
             for pg in chk:
                 t = pg.get_text()
-                if any(k.decode('utf-8', 'replace').lower() in t.lower() for k in keywords):
+                if _resid_kw and any(k.decode('utf-8', 'replace').lower() in t.lower() for k in _resid_kw):
                     resid += 1
             left_imgs = [g for pg in chk for g in pg.get_images(full=True) if g[0] in confirmed_xrefs]
             chk.close()
@@ -2994,6 +3073,11 @@ class UltraAppFinal(QMainWindow):
         self.dpiwm_worker = None
         self._dpi_select_mode = False  # True = 左侧预览进入"选图"模式
         self._dpi_selected_xref = None  # 用户选中的图片 xref
+        # 路径水印（P6）：选图模式 + 路径属性匹配删除
+        self.pathwm_worker = None
+        # 预览调暗高亮：原始图像（未调暗版本）
+        self._preview_orig_img_orig = None
+        self._preview_orig_img_clean = None
 
         self.scale = QApplication.primaryScreen().logicalDotsPerInch() / 96.0
         self.init_ui(); self.setAcceptDrops(True)
@@ -3267,14 +3351,17 @@ class UltraAppFinal(QMainWindow):
                 self._dpi_hover_tip.raise_()
             elif et == QEvent.Type.Leave:
                 self._dpi_hover_tip.hide()
+                # 离开预览时恢复调暗版
+                self._restore_dimmed_preview(source)
             elif et == QEvent.Type.MouseMove:
                 gp = event.globalPosition().toPoint()
                 if self._dpi_hover_tip.isVisible():
-                    # move() 取父控件本地坐标，需从全局坐标转换
                     lp = self.mapFromGlobal(gp)
                     self._dpi_hover_tip.move(lp.x() + 16, lp.y() + 18)
                     self._dpi_hover_tip.raise_()
-            return False  # 不拦截，保留滚动等正常行为
+                # 鼠标移动时高亮元素
+                self._highlight_element_at(source, event.position().toPoint())
+            return False
         # --- 左键拖框放大（非选图模式） ---
         if source in (self.lab_orig, self.lab_clean):
             if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -3467,8 +3554,8 @@ class UltraAppFinal(QMainWindow):
                         'dpi_y': round(h * 72.0 / max(r.height, 1), 1),
                     })
         if not hits:
-            self.add_log(f">>> 未命中任何图片（点 ({px:.1f},{py:.1f})）")
-            QMessageBox.information(self, "选图", "点击位置没有图片。请点到水印上再试。")
+            # 没有图片，尝试检测路径
+            self._try_select_path_at(page, point, px, py)
             return
         # 取面积最小的（最上层，最可能是水印）
         target = min(hits, key=lambda x: x['area'])
@@ -3488,7 +3575,7 @@ class UltraAppFinal(QMainWindow):
             self._dpi_selected_xref = None
             self._dpi_select_mode = False
             self._dpi_hover_tip.hide()
-            self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+            self.btn_dpiwm.setText(TRANSLATIONS[self.lang]["dpi_wm"])
             return
         _dbg('dpi_select_at 用户确认, get_match_mode...')
         match = dlg.get_match_mode()  # "dpi" or "size"
@@ -3497,7 +3584,7 @@ class UltraAppFinal(QMainWindow):
         # 关闭选图模式
         self._dpi_select_mode = False
         self._dpi_hover_tip.hide()
-        self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+        self.btn_dpiwm.setText(TRANSLATIONS[self.lang]["dpi_wm"])
 
         # 扫描全 PDF 找匹配的图片
         self.add_log(f">>> 开始扫描匹配 (mode={match}, scope={scope})...")
@@ -3629,13 +3716,15 @@ class UltraAppFinal(QMainWindow):
             self._dpi_select_mode = False
             self._dpi_selected_xref = None
             self._dpi_hover_tip.hide()
-            self.btn_dpiwm.setText("🎯 按 DPI 去水印")
+            self.btn_dpiwm.setText(TRANSLATIONS[self.lang]["dpi_wm"])
             self.add_log(f">>> 退出选图模式")
+            self.update_previews()
             return
 
         self._dpi_select_mode = True
         self._dpi_selected_xref = None
-        self.btn_dpiwm.setText("🎯 点击选择水印图片")
+        self.btn_dpiwm.setText(TRANSLATIONS[self.lang]["dpi_wm_select"])
+        self.update_previews()
         # tooltip 不在此处显示，等鼠标移入预览区域时由 eventFilter 自动显示
         self.add_log(f">>> 进入选图模式：请在左侧预览里【点击】一张水印图片。按 Esc 或再点本按钮可退出。")
 
@@ -3672,8 +3761,25 @@ class UltraAppFinal(QMainWindow):
                 z = compute_zoom(doc, scroll)
                 pix = doc[idx].get_pixmap(matrix=fitz.Matrix(z, z))
                 qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+
+                if self._dpi_select_mode:
+                    # 选图模式：渲染调暗30%的预览，保存原始图像用于高亮恢复
+                    orig_img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+                    painter = QPainter(qimg)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(QColor(0, 0, 0, 77)))  # 30%暗度 = 77/255
+                    painter.drawRect(0, 0, qimg.width(), qimg.height())
+                    painter.end()
+                    if lab is self.lab_orig:
+                        self._preview_orig_img_orig = orig_img
+                    else:
+                        self._preview_orig_img_clean = orig_img
+                else:
+                    self._preview_orig_img_orig = None
+                    self._preview_orig_img_clean = None
+
                 lab.setPixmap(QPixmap.fromImage(qimg))
-                lab.setFixedSize(pix.width, pix.height)  # 尺寸超过视口时滚动条出现
+                lab.setFixedSize(pix.width, pix.height)
                 if self.fit_mode != "custom":
                     self.zoom_label.setText(f"{int(z * 100)}%")
             except Exception as e:
@@ -3695,6 +3801,214 @@ class UltraAppFinal(QMainWindow):
         self.config["last_dir"] = os.path.dirname(path)
         save_config(self.config)
         self.rebuild_recent_menu()
+
+    def _highlight_element_at(self, lab, pt):
+        """在选图模式下，鼠标指向的元素恢复原始亮度（不暗）。"""
+        if not self._dpi_select_mode:
+            return
+        doc = self.doc_orig if lab is self.lab_orig else self.doc_clean
+        if doc is None:
+            return
+
+        # 获取原始图像（未调暗的版本）
+        orig_img = getattr(self, '_preview_orig_img_orig' if lab is self.lab_orig else '_preview_orig_img_clean', None)
+        if orig_img is None or orig_img.isNull():
+            return
+
+        idx = self.page_spin.value() - 1
+        if idx < 0 or idx >= doc.page_count:
+            return
+
+        page = doc[idx]
+        lw, lh = lab.width(), lab.height()
+        if lw <= 0 or lh <= 0:
+            return
+
+        # 像素 → PDF 坐标
+        px = page.rect.width * pt.x() / lw
+        py = page.rect.height * pt.y() / lh
+        point = fitz.Point(px, py)
+
+        # 查找鼠标指向的元素
+        highlight_rect = None
+
+        # 先检查图片
+        for entry in page.get_images(full=True):
+            xref = entry[0]
+            try:
+                rects = page.get_image_rects(xref)
+                for r in rects:
+                    if r.contains(point):
+                        highlight_rect = QRect(
+                            int(r.x0 / page.rect.width * lw),
+                            int(r.y0 / page.rect.height * lh),
+                            int(r.width / page.rect.width * lw),
+                            int(r.height / page.rect.height * lh)
+                        )
+                        break
+            except Exception:
+                continue
+            if highlight_rect:
+                break
+
+        # 如果没有图片，检查路径
+        if not highlight_rect:
+            drawings = page.get_drawings(extended=True)
+            for d in drawings:
+                if d.get('rect') and d['rect'].contains(point):
+                    highlight_rect = QRect(
+                        int(d['rect'].x0 / page.rect.width * lw),
+                        int(d['rect'].y0 / page.rect.height * lh),
+                        int(d['rect'].width / page.rect.width * lw),
+                        int(d['rect'].height / page.rect.height * lh)
+                    )
+                    break
+
+        # 恢复原始图像 + 绘制高亮边框
+        if highlight_rect and not orig_img.isNull():
+            # 创建当前图像副本（调暗版）
+            cur_img = lab.pixmap().toImage().copy()
+            # 恢复元素区域为原始亮度
+            cur_img.copy(orig_img, highlight_rect)
+
+            # 绘制高亮边框
+            painter = QPainter(cur_img)
+            painter.setPen(QPen(QColor(255, 255, 0), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            expanded = highlight_rect.adjusted(-2, -2, 2, 2)
+            painter.drawRect(expanded)
+            painter.end()
+
+            lab.setPixmap(QPixmap.fromImage(cur_img))
+
+    def _restore_dimmed_preview(self, lab):
+        """鼠标离开预览时恢复调暗版。"""
+        if not self._dpi_select_mode:
+            return
+        self.update_previews()
+
+    def _try_select_path_at(self, page, point, px, py):
+        """在点击位置选择路径水印，弹出 PathMatchDialog。"""
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            from PathMatchDialog import PathMatchDialog
+            from path_wm import count_matching_paths
+        except ImportError:
+            QMessageBox.warning(self, "错误", "无法加载 PathMatchDialog")
+            return
+
+        doc = self.doc_orig if self.doc_orig else self.doc_clean
+        if doc is None:
+            return
+
+        drawings = page.get_drawings(extended=True)
+        # 查找点击位置的路径
+        hit = None
+        for d in drawings:
+            if d.get('rect') and d['rect'].contains(point):
+                hit = d
+                break
+
+        if not hit:
+            # 退而求其次：扫描页面内容流，找包含点击点的路径块。
+            # 适用于路径被容器/对象间接组织、get_drawings 命中不到的情况。
+            try:
+                for xref in page.get_contents():
+                    stream = self.doc_orig.xref_stream(xref) if self.doc_orig else None
+                    if not stream:
+                        continue
+                    text = stream.decode('latin-1', errors='replace')
+                    count, matches = count_matching_paths(text)
+                    if count and matches:
+                        hit = matches[0]
+                        break
+            except Exception:
+                pass
+
+        if not hit:
+            QMessageBox.information(self, "选择路径", "点击位置没有路径。")
+            return
+
+        # 确定填充色（从 drawing 属性获取）
+        fill_color = None
+        if hit.get('fill') and hit['fill'] != (0.0, 0.0, 0.0):
+            fill_color = hit['fill']
+
+        # 构造对话框
+        idx = self.page_spin.value() - 1
+        try:
+            dlg = PathMatchDialog(doc, idx, self._working_path, page.rect, self.scale, self)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log_exception(e, "_try_select_path_at construct")
+            QMessageBox.warning(self, "错误", f"构造对话框失败: {e}\n{tb}")
+            return
+
+        # 自动填充颜色
+        if fill_color:
+            dlg.fill_row.set_color(fill_color)
+
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+
+        # 用户确认后，退出选图模式
+        if self._dpi_select_mode:
+            self._dpi_select_mode = False
+            self._dpi_selected_xref = None
+            self._dpi_hover_tip.hide()
+            self.btn_dpiwm.setText(TRANSLATIONS[self.lang]["dpi_wm"])
+            self.update_previews()
+            self.add_log(">>> 已退出选图模式")
+
+        settings = dlg.get_settings()
+
+        # 启动后台删除
+        self.pbar.setValue(0)
+        self.btn_dpiwm.setEnabled(False)
+
+        try:
+            from PathWmWorker import PathWmWorker
+            self.pathwm_worker = PathWmWorker(self._working_path, settings, self)
+            self.pathwm_worker.progress.connect(self._pathwm_progress)
+            self.pathwm_worker.done.connect(self._pathwm_finished)
+            self.pathwm_worker.error.connect(self._pathwm_failed)
+            self.pathwm_worker.start()
+        except Exception as e:
+            self.btn_dpiwm.setEnabled(True)
+            QMessageBox.critical(self, "错误", f"启动删除失败: {e}")
+
+    def _pathwm_progress(self, percent, msg):
+        self.pbar.setValue(percent)
+        self.add_log(f">>> {msg}")
+
+    def _pathwm_finished(self, doc, out_path):
+        """路径水印删除完成回调。doc 是 fitz.Document 对象，out_path 是输出路径。"""
+        self.btn_dpiwm.setEnabled(True)
+        self.add_log(f">>> 路径水印删除完成: {out_path}")
+        try:
+            if self.doc_clean is not None:
+                try:
+                    self.doc_clean.close()
+                except Exception:
+                    pass
+            self.doc_clean = doc  # 直接使用 worker 传来的 fitz 文档，无需重新打开
+            self._working_path = out_path
+            self.btn_save.setEnabled(True)
+            self.btn_save_as.setEnabled(True)
+            self._pending_path = out_path
+            self.update_previews()
+        except Exception as e:
+            self.add_log(f">>> 打开处理结果失败: {e}")
+
+    def _pathwm_failed(self, err):
+        self.btn_dpiwm.setEnabled(True)
+        self.add_log(f">>> 路径水印删除失败: {err}")
+        try:
+            QMessageBox.critical(self, "处理失败", str(err))
+        except Exception:
+            pass
 
     def load_pdf(self, path):
         """加载 PDF 文件（文件对话框、拖拽、最近文件共用的入口）。"""
@@ -3724,8 +4038,8 @@ class UltraAppFinal(QMainWindow):
         self._working_path = path  # 工作基底 = 原文件（去水印叠加的起点）
         self.btn_save.setEnabled(False)
         self.btn_save_as.setEnabled(False)
-        self.btn_imgwm.setEnabled(bool(self.doc_orig))
-        self.btn_dpiwm.setEnabled(bool(self.doc_orig))
+        self.btn_imgwm.setEnabled(True)
+        self.btn_dpiwm.setEnabled(True)
         self.page_spin.setRange(1, len(self.doc_orig)); self.page_spin.setValue(1)
         self.add_log(f"File loaded: {os.path.basename(path)} ({len(self.doc_orig)} pages, {os.path.getsize(path):,} bytes)")
         self._update_recent(path)
