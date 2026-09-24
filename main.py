@@ -97,6 +97,31 @@ REQUIRED_DEPS = {
 }
 
 
+# 冻结（PyInstaller）构建标记。
+# 关键：冻结包里 sys.executable 就是本 EXE，一旦走 pip 安装路径，
+# subprocess 会把 EXE 自己再启动一遍（无 -m pip 也照样启动 GUI），
+# 子进程又发现缺包 → 再启动自身 → 递归自启动；
+# 而且 -w（无控制台）构建里 sys.stdin/stdout/stderr 全是 None，
+# 在 input()/print() 处直接抛异常 → 进程 fail-fast 退出（0xC0000409），
+# 界面上只看到一句 Traceback。因此冻结构建必须完全跳过依赖安装。
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _startup_log(msg):
+    """启动阶段的日志（此刻 app 日志器尚未初始化，直接追加到当日日志文件）。"""
+    try:
+        path = os.path.join(
+            os.environ.get('APPDATA', os.path.expanduser('~')),
+            'ExtremePDFCleaner', 'logs',
+            'app_%s.log' % datetime.now().strftime('%Y%m%d')
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write('[%s] %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg))
+    except Exception:
+        pass
+
+
 def check_dependencies(quiet=False):
     """检查 REQUIRED_DEPS 里的模块，返回缺失的 (name, package) 列表。"""
     missing = []
@@ -110,6 +135,10 @@ def check_dependencies(quiet=False):
 
 def install_missing_packages(missing):
     """用 pip 安装缺失包，返回 (success, output)。"""
+    if FROZEN:
+        # 冻结包里 sys.executable 是本 EXE：跑 pip 等于递归启动自身 → 崩溃。
+        return False, ("frozen build: pip 自安装已禁用"
+                       "（sys.executable 指向本 EXE，会递归启动自身）")
     pkgs = [pkg for _, pkg in missing]
     if not pkgs:
         return True, "no packages to install"
@@ -147,6 +176,8 @@ def confirm_and_install_deps():
     """缺失依赖时弹框确认并安装。返回 True 表示继续，False 表示用户取消或安装失败。
     即使 PyQt6 缺失（因此无 GUI）也能通过命令行提示 + 直接安装 + 命令行反馈完成流程。
     """
+    if FROZEN:
+        return True   # 冻结包自带运行时，不做依赖检查/安装
     missing = check_dependencies()
     if not missing:
         return True
@@ -241,7 +272,16 @@ def confirm_and_install_deps():
 # 用 check_dependencies() 判断：若空则跳过；否则调用 confirm_and_install_deps()
 # 后者内部有命令行兜底，即使 PyQt6 缺失也能提示用户并安装
 try:
-    _missing_at_startup = check_dependencies()
+    if FROZEN:
+        # 冻结构建：自带 PyQt6/pikepdf/pymupdf/xxhash。
+        # 这里既不检查也不安装依赖：
+        #   - 安装会调用 sys.executable（=本 EXE）→ 递归自启动 → fail-fast 崩溃；
+        #   - 检查会 import cv2/numpy，从 onefile 归档解压导入要几十秒，白拖慢启动。
+        # 缺可选模块时由对应功能自己提示（色彩水印）。
+        _missing_at_startup = []
+        _startup_log(">>> 冻结版启动：跳过依赖检查/自安装（可选模块缺失不影响其它功能）")
+    else:
+        _missing_at_startup = check_dependencies()
     if _missing_at_startup:
         _ok = confirm_and_install_deps()
         if not _ok:
@@ -2465,7 +2505,21 @@ class ImageWmWorker(QThread):
 
     def run(self):
         import gc, time
-        import cv2, numpy as np
+        # cv2/numpy 必须在 try 内导入：缺包时抛出的异常若穿过 QThread.run()
+        # 会让 PyQt 触发 qFatal → 进程直接 abort（窗口版看不到任何报错）。
+        try:
+            import cv2
+            import numpy as np
+        except Exception as _imp_err:
+            self.log_signal.emit(
+                f">>> 色彩水印需要 opencv-python 与 numpy，当前环境缺少：{_imp_err}"
+            )
+            self.failed.emit(
+                "缺少 opencv-python / numpy，色彩水印不可用。\n"
+                "（源码运行：pip install opencv-python numpy；"
+                "或使用包含这两个库的完整打包版本）"
+            )
+            return
         try:
             ch = self.settings['channel']
             fill = self.settings['fill']
