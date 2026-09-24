@@ -92,7 +92,7 @@ REQUIRED_DEPS = {
     "pikepdf":   {"import_name": "pikepdf", "package": "pikepdf"},
     "PyQt6":     {"import_name": "PyQt6",  "package": "PyQt6"},
     "xxhash":    {"import_name": "xxhash", "package": "xxhash"},
-    "opencv-python": {"import_name": "cv2", "package": "opencv-python"},
+    "opencv-python": {"import_name": "cv2", "package": "opencv-python-headless"},
     "numpy":     {"import_name": "numpy",  "package": "numpy"},
 }
 
@@ -2515,8 +2515,8 @@ class ImageWmWorker(QThread):
                 f">>> 色彩水印需要 opencv-python 与 numpy，当前环境缺少：{_imp_err}"
             )
             self.failed.emit(
-                "缺少 opencv-python / numpy，色彩水印不可用。\n"
-                "（源码运行：pip install opencv-python numpy；"
+                "缺少 opencv-python-headless / numpy，色彩水印不可用。\n"
+                "（源码运行：pip install opencv-python-headless numpy；"
                 "或使用包含这两个库的完整打包版本）"
             )
             return
