@@ -16,8 +16,32 @@ from concurrent.futures import ProcessPoolExecutor
 # --- Debug 模式（崩溃诊断）---
 # 启用方式：命令行 --debug 或环境变量 PDF_DEBUG=1
 # 日志输出到 %APPDATA%/ExtremePDFCleaner/logs/debug.log
+#
+# faulthandler 固定写文件、绝不写 stderr：
+# PyInstaller -w（无控制台）构建里 sys.stderr is None，
+# 直接调用 faulthandler.enable() 会抛 RuntimeError: sys.stderr is None，
+# 窗口版 EXE 会在启动瞬间崩溃。写文件同时也让原生崩溃留下栈。
 import faulthandler
-faulthandler.enable()
+
+CRASH_LOG_PATH = os.path.join(
+    os.environ.get('APPDATA', os.path.expanduser('~')),
+    'ExtremePDFCleaner', 'logs', 'crash.log'
+)
+_fault_file = None
+try:
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        _fault_file = open(CRASH_LOG_PATH, 'a', buffering=1, encoding='utf-8', errors='replace')
+        faulthandler.enable(file=_fault_file, all_threads=True)
+    except Exception:
+        # 退路：仅在确实存在 stderr（控制台运行）时才用 stderr
+        try:
+            if sys.stderr is not None:
+                faulthandler.enable()
+        except Exception:
+            pass
+except Exception:
+    pass
 
 DEBUG = os.environ.get('PDF_DEBUG', '').lower() in ('1', 'true', 'yes', 'on')
 if '--debug' in sys.argv:
