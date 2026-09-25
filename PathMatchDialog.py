@@ -284,7 +284,7 @@ class PathMatchDialog(QtWidgets.QDialog):
                     painter.drawRect(rect)
             else:
                 painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160)))
-                painter.drawText(QtCore.QRectF(0, 0, pix.width, pix.height), QtGui.Qt.AlignmentFlag.AlignCenter, "当前页未命中")
+                painter.drawText(QtCore.QRectF(0, 0, pix.width, pix.height), QtCore.Qt.AlignmentFlag.AlignCenter, "当前页未命中")
             painter.end()
 
             # 预览保持原始宽高比，避免被标签拉伸变形

@@ -27,10 +27,18 @@ CRASH_LOG_PATH = os.path.join(
     os.environ.get('APPDATA', os.path.expanduser('~')),
     'ExtremePDFCleaner', 'logs', 'crash.log'
 )
+def _ensure_crash_log():
+    """确保 crash.log 所在目录存在（hook 里兜底用）。"""
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+    except Exception:
+        pass
+
+
 _fault_file = None
 try:
     try:
-        os.makedirs(os.path.dirname(CRASH_LOG_PATH), exist_ok=True)
+        _ensure_crash_log()
         _fault_file = open(CRASH_LOG_PATH, 'a', buffering=1, encoding='utf-8', errors='replace')
         faulthandler.enable(file=_fault_file, all_threads=True)
     except Exception:
@@ -75,11 +83,26 @@ def _dbg_exc(ctx, exc):
     _dbg(traceback.format_exc())
 
 # 全局未捕获异常 hook
+# 重要：无条件写日志（不再只在 --debug 时写）。
+# PyQt6 在槽/虚函数里遇到未捕获异常时会调用 sys.excepthook，随后 qFatal→abort；
+# 装了这个 hook 才能把 traceback 留在 crash.log 里，否则窗口版 EXE 会静默闪退。
 _orig_excepthook = sys.excepthook
 def _debug_excepthook(exc_type, exc_value, exc_tb):
     try:
+        txt = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    except Exception:
+        txt = f'{exc_type.__name__}: {exc_value}'
+    try:
         _dbg(f'UNCAUGHT: {exc_type.__name__}: {exc_value}')
-        _dbg(''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        _dbg(txt)
+    except Exception:
+        pass
+    try:
+        _ensure_crash_log()
+        with open(CRASH_LOG_PATH, 'a', encoding='utf-8', errors='replace') as f:
+            f.write(f'\n[UNCAUGHT EXCEPTION {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]\n')
+            f.write(txt)
+            f.write('\n')
     except Exception:
         pass
     _orig_excepthook(exc_type, exc_value, exc_tb)
@@ -3946,8 +3969,12 @@ class UltraAppFinal(QMainWindow):
         if highlight_rect and not orig_img.isNull():
             # 创建当前图像副本（调暗版）
             cur_img = lab.pixmap().toImage().copy()
-            # 恢复元素区域为原始亮度
-            cur_img.copy(orig_img, highlight_rect)
+            # 恢复元素区域为原始亮度。
+            # 注意：QImage.copy(img, rect) 在 PyQt6 里不存在（只有 copy()/copy(rect)/copy(x,y,w,h)），
+            # 必须用 QPainter.drawImage(目标矩形, 源图, 源矩形) 把原图区域画回去。
+            _p = QPainter(cur_img)
+            _p.drawImage(highlight_rect, orig_img, highlight_rect)
+            _p.end()
 
             # 绘制高亮边框
             painter = QPainter(cur_img)
