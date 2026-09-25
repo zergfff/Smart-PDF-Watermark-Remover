@@ -123,65 +123,14 @@ class PathWmWorker(QtCore.QThread):
             self.progress.emit(95, "保存中...")
             pdf.save(self.out_path)
 
-        # 3. 安全兜底：只按命中图元自身的颜色/描边过滤，再对其精确框做覆盖。
-        #    这样正文矢量若颜色不同，不会被一起删掉。
+        # 3. 已移除"几何兜底"（红化框 + PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED）。
+        #    原因：该兜底按"是否碰到红化框"删除矢量，**颜色完全不参与判定**，
+        #    因此选中灰色(191)填充时，与框相交的白色(255)填充也会被一起删掉
+        #    （实测 page0：白 1→0、灰 7→6）。颜色筛选只在内容流删除那一步生效，
+        #    兜底把这一步的成果覆盖了。内容流删除已按 fill_color/stroke_color
+        #    精确匹配（容差 0.02），且第 0 步已展平容器，兜底无存在必要。
         total_removed = content_removed_total
-        fallback_path = None
-        try:
-            doc = fitz.open(self.out_path)
-            fitz_removed = 0
-            for pno in range(doc.page_count):
-                page = doc[pno]
-                page_drawings = page.get_drawings(extended=True)
-                kept = []
-                for d in page_drawings:
-                    r = d.get('rect')
-                    if not r:
-                        continue
-                    fill = d.get('fill')
-                    stroke = d.get('color')
-                    if match_fill and fill_color is not None:
-                        if fill is not None and self._color_close(fill, fill_color):
-                            kept.append(r)
-                        continue
-                    if match_stroke and stroke_color is not None:
-                        if stroke is not None and self._color_close(stroke, stroke_color):
-                            kept.append(r)
-                        continue
-                    kept.append(r)
-
-                annots = []
-                for r in kept:
-                    annots.append(r)
-
-                if annots:
-                    for r in annots:
-                        page.add_redact_annot(r, fill=False, text=None, cross_out=False)
-                    page.apply_redactions(
-                        images=fitz.PDF_REDACT_IMAGE_NONE,
-                        graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
-                        text=fitz.PDF_REDACT_TEXT_NONE,
-                    )
-                    fitz_removed += len(annots)
-                    total_removed += len(annots)
-                    self.progress.emit(
-                        int((pno + 1) / doc.page_count * 100),
-                        f"Page {pno+1}/{doc.page_count}: 兜底覆盖 {len(annots)} 个命中图元 (累计 {total_removed})"
-                    )
-
-            if fitz_removed:
-                fallback_path = self.out_path + '_redacted.pdf'
-                doc.save(fallback_path, garbage=4, deflate=True)
-                doc.close()
-                try:
-                    import os as _os
-                    _os.replace(fallback_path, self.out_path)
-                except Exception:
-                    fallback_path = None
-            else:
-                doc.close()
-        except Exception as e:
-            self.progress.emit(96, f"兜底覆盖失败: {e}")
+        self.progress.emit(96, f"内容流删除完成: {total_removed} 个路径（已不做几何兜底）")
 
         # 4. 用 fitz 重新打开用于预览
         doc = fitz.open(self.out_path)

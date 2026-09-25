@@ -109,11 +109,22 @@ def extract_path_blocks(content: str) -> list:
         path_start_token = None
         path_start_pos = None
 
-    def apply_color_to_last(c):
+    def apply_color_to_last(c, is_fill=True):
+        """颜色操作符出现在绘制之后时的补偿：只补该通道的**空缺**，绝不覆盖已记录的颜色。
+
+        原实现无条件把 fill/stroke 都改成新颜色，会把上一个已绘制块的颜色改错
+        （实测：clean_contents() 重写后 `0 0 0 RG` 紧跟 `rg .749`，填充色被改成黑色，
+         导致"按填充色匹配"命中 0 —— 于是只能靠几何兜底删，颜色区分失效）。
+        """
         nonlocal last_block_idx
-        if last_block_idx >= 0:
-            blocks[last_block_idx]['fill_color'] = c
-            blocks[last_block_idx]['stroke_color'] = c
+        if last_block_idx < 0:
+            return
+        if is_fill:
+            if blocks[last_block_idx].get('fill_color') is None:
+                blocks[last_block_idx]['fill_color'] = c
+        else:
+            if blocks[last_block_idx].get('stroke_color') is None:
+                blocks[last_block_idx]['stroke_color'] = c
 
     for idx, (tok, start, end) in enumerate(tokens):
         op = tok
@@ -143,9 +154,12 @@ def extract_path_blocks(content: str) -> list:
             if idx >= 3:
                 try:
                     c = (float(tokens[idx - 3][0]), float(tokens[idx - 2][0]), float(tokens[idx - 1][0]))
-                    cur_fill = c
-                    cur_stroke = c
-                    apply_color_to_last(c)
+                    if op == 'rg':
+                        cur_fill = c           # 仅填充色
+                        apply_color_to_last(c, True)
+                    else:
+                        cur_stroke = c         # 仅描边色（原实现会连带改掉填充色 → 颜色归属错）
+                        apply_color_to_last(c, False)
                 except ValueError:
                     pass
             continue
@@ -156,9 +170,12 @@ def extract_path_blocks(content: str) -> list:
                     c, m, y, k = (float(tokens[idx - 4][0]), float(tokens[idx - 3][0]),
                                   float(tokens[idx - 2][0]), float(tokens[idx - 1][0]))
                     rgb = (1.0 - min(1.0, c + k), 1.0 - min(1.0, m + k), 1.0 - min(1.0, y + k))
-                    cur_fill = rgb
-                    cur_stroke = rgb
-                    apply_color_to_last(rgb)
+                    if op == 'k':
+                        cur_fill = rgb
+                        apply_color_to_last(rgb, True)
+                    else:
+                        cur_stroke = rgb
+                        apply_color_to_last(rgb, False)
                 except ValueError:
                     pass
             continue
@@ -168,18 +185,25 @@ def extract_path_blocks(content: str) -> list:
                 try:
                     v = float(tokens[idx - 1][0])
                     c = (v, v, v)
-                    cur_fill = c
-                    cur_stroke = c
-                    apply_color_to_last(c)
+                    if op == 'g':
+                        cur_fill = c
+                        apply_color_to_last(c, True)
+                    else:
+                        cur_stroke = c
+                        apply_color_to_last(c, False)
                 except ValueError:
                     pass
             continue
 
         if op in ('cs', 'CS'):
             if idx >= 1:
-                cur_fill = ('pattern', tokens[idx - 1][0])
-                cur_stroke = cur_fill
-                apply_color_to_last(cur_fill)
+                pat = ('pattern', tokens[idx - 1][0])
+                if op == 'cs':
+                    cur_fill = pat
+                    apply_color_to_last(pat, True)
+                else:
+                    cur_stroke = pat
+                    apply_color_to_last(pat, False)
             continue
 
         if in_path and op not in ('w', 'd', 'ri', 'i', 'j', 'J', 'M', 'TR', 'q', 'Q', 'cm', 'BT', 'ET', 'Do'):
@@ -286,8 +310,18 @@ def get_page_stream(pdf, page) -> Optional[str]:
 def set_page_stream(pdf, page, new_content: str) -> bool:
     """将修改后的内容流写回页面。"""
     try:
-        obj = pdf.make_indirect(pikepdf.Name.Stream, new_content.encode('latin-1'))
-        page.set('/Contents', obj)
+        # 旧实现写的是 pikepdf.Name.Stream —— 那是 Name 对象不是 Stream，
+        # make_indirect 会报错 → 每次都返回 False（写入失败），
+        # 于是"内容流按颜色删除"这一整段实际上从未生效，全靠几何兜底在删（颜色不参与）。
+        data = new_content.encode('latin-1')
+        try:
+            obj = pikepdf.Stream(pdf, data)
+        except Exception:
+            # 退路：直接构造 stream 字典对象
+            obj = pdf.make_indirect(pikepdf.Dictionary(
+                Length=len(data), **{'/Filter': None}))
+            obj.write(data)
+        page['/Contents'] = obj
         return True
     except Exception:
         return False
