@@ -2551,14 +2551,21 @@ class MasterWorker(QThread):
         # 复检：文本残留页 + 图片 xref 残留
         resid = 0
         left_imgs = []
+        left_txt_names = []
         try:
+            # 文本复检改为"与删除端同口径"：把确认过的候选再拿回输出文件的流里做一次 dry-run 匹配。
+            # 旧实现用整页子串包含 → 短候选（'1.'、'01'）出现在正文里就假报残留。
+            if tc:
+                try:
+                    import text_stream_remover as _tsr_chk
+                    with pikepdf.open(out_path) as _op:
+                        _r2, _h2, _still, _c2 = _tsr_chk.remove_candidate_text(
+                            _op, tc, log=None, dry_run=True)
+                    left_txt_names = list(_still or [])
+                    resid = len(left_txt_names)
+                except Exception as _e:
+                    self.log_signal.emit(f">>> text residual check skipped: {_e}")
             chk = fitz.open(out_path)
-            # 1 字符关键词（如 '-'）会命中正文里普通连字符 → 复检时跳过，避免假报残留
-            _resid_kw = [k for k in keywords if len(k) >= 2]
-            for pg in chk:
-                t = pg.get_text()
-                if _resid_kw and any(k.decode('utf-8', 'replace').lower() in t.lower() for k in _resid_kw):
-                    resid += 1
             # 残留校验按内容哈希：保存会重排对象编号，按 xref 编号比对会产生假残留
             left_imgs = []
             if ic_set:
@@ -2586,7 +2593,11 @@ class MasterWorker(QThread):
         if resid == 0 and not left_imgs:
             self.log_signal.emit(">>> Verify passed: no residual")
         else:
-            self.log_signal.emit(f">>> Verify warning: text residual {resid} pages, image residual {len(left_imgs)}")
+            if left_txt_names:
+                for _n in left_txt_names[:10]:
+                    self.log_signal.emit(f">>> Verify: 勾选的文本候选仍存在（未删除）: {str(_n)[:70]}")
+            self.log_signal.emit(
+                f">>> Verify warning: text candidates still present {resid}, image residual {len(left_imgs)}")
         return out_path
 
 # --- 3.9 图像层水印去除工作线程（P4：整页位图里的彩色广告水印） ---

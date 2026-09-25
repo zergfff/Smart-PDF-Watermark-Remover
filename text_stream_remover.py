@@ -761,33 +761,43 @@ def _find_cuts(buf, font_info, uniq):
                                 u1 = max(uset) + 1
                                 pieces.append((pi, u0, u1, len(uset) == (u1 - u0)))
                             cand_ops.setdefault(rc, set()).add(op3[0])
+                            two_b = bool((font_info.get(op3[3]) or {}).get('two_byte'))
                             if fully:
                                 cuts.append((op3[0], op3[1], rc, len(n_cand), None))
                             else:
-                                two_b = bool((font_info.get(op3[3]) or {}).get('two_byte'))
-                                for pi, u0, u1, contiguous in pieces:
-                                    if not contiguous:
-                                        continue
-                                    cuts.append((op3[0], op3[1], rc, len(n_cand), (pi, u0, u1, two_b)))
+                                # 按连续单元区间逐段裁剪（同一条操作符可能同时承载多个候选的文字）
+                                for pi, uset in per_payload.items():
+                                    us = sorted(uset)
+                                    run_start = prev = us[0]
+                                    for u in us[1:] + [None]:
+                                        if u is not None and u == prev + 1:
+                                            prev = u
+                                            continue
+                                        cuts.append((op3[0], op3[1], rc, len(n_cand),
+                                                     (pi, run_start, prev + 1, two_b)))
+                                        if u is not None:
+                                            run_start = prev = u
                 st = norm_text.find(n_cand, st + 1)
 
-    # 去重 + 冲突消解：同一条操作符只能有一个动作（整条删除优先于条内裁剪），
-    # 否则会对同一区间重复删除，误删相邻字节。
-    by_op = {}
+    # 去重（并集语义）：同一条操作符上可能同时要删多个候选的文字，
+    # 必须保留所有*不同的*裁剪区间；若该操作符有整条删除，则它的裁剪区间可全部丢弃。
+    whole_ops = set(c[0] for c in cuts if c[4] is None)
+    seen = set()
+    out = []
     for c in cuts:
-        key = c[0]
-        cur = by_op.get(key)
-        if cur is None:
-            by_op[key] = c
-        else:
-            if cur[4] is None or c[4] is None:
-                by_op[key] = (c[0], c[1], c[2], c[3], None)   # 整条删除优先
-            else:
-                by_op[key] = cur                              # 保留第一个裁剪动作
-    return list(by_op.values()), cand_ops
+        if c[4] is None:
+            pass
+        elif c[0] in whole_ops:
+            continue                      # 该 op 整条都删，无需再裁剪
+        key = (c[0], c[4][0], c[4][1], c[4][2]) if c[4] is not None else (c[0], -1, -1, -1)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out, cand_ops
 
 
-def remove_candidate_text(pdf, candidates, log=None):
+def remove_candidate_text(pdf, candidates, log=None, dry_run=False):
     """从 pdf 各页内容流与所有 Form 内部流删除与候选匹配的文本操作符。
 
     覆盖两种曾经的漏删场景：
@@ -834,7 +844,10 @@ def remove_candidate_text(pdf, candidates, log=None):
         # 从后往前应用，保证偏移不失效。两种动作：
         #   trim=None → 删除整条操作符
         #   trim=(payload_idx,u0,u1,two_byte) → 只裁掉该字符串里的字符单元（候选是长串的一段）
-        for start, end, rc, tlen, trim in sorted(cuts, key=lambda x: -(x[0])):
+        def _sort_key(c):
+            t = c[4]
+            return (c[0], (t[0] if t else -1), (t[1] if t else -1))
+        for start, end, rc, tlen, trim in sorted(cuts, key=_sort_key, reverse=True):
             st, en = start - base_off, end - base_off
             if trim is None:
                 if 0 <= st < en <= len(new):
@@ -852,6 +865,8 @@ def remove_candidate_text(pdf, candidates, log=None):
                     removed_ops += 1
                     removed_chars += tlen
                     applied_ops.add(start)
+        if dry_run:
+            return
         try:
             stream_obj.write(bytes(new))
         except Exception as e:
