@@ -245,7 +245,10 @@ def find_matching_paths(content: str, fill_color=None, stroke_color=None,
             if not colors_match(block['stroke_color'], stroke_color):
                 continue
         if match_opacity and opacity is not None:
-            if block['opacity'] is None or abs(block['opacity'] - opacity) > 0.01:
+            # 软条件：只有当块**自身记录了**透明度且与用户设定明显不同时才过滤。
+            # 绝大多数路径流里没有 /GS 透明度（记为 None），
+            # 旧实现把 None 当"不匹配"直接滤掉 → 用户选好了填充色却删 0 个。
+            if block['opacity'] is not None and abs(block['opacity'] - opacity) > 0.01:
                 continue
         matches.append(block)
     return matches

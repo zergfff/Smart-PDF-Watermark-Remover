@@ -4109,12 +4109,20 @@ class UltraAppFinal(QMainWindow):
             return
 
         drawings = page.get_drawings(extended=True)
-        # 查找点击位置的路径
+        # 查找点击位置的路径：取**面积最小**的那个（最具体的图元）。
+        # 旧实现取第一个命中的，而页面常有铺满整页的白色背景矩形排在前面，
+        # 于是点灰色水印会选中白色背景 → 用户感觉"找不到目标路径"。
+        # 面积相同时按绘制顺序取后者（后画的在上层）。
         hit = None
+        _best_area = None
         for d in drawings:
-            if d.get('rect') and d['rect'].contains(point):
+            r = d.get('rect')
+            if not r or not r.contains(point):
+                continue
+            area = abs((r.width or 0) * (r.height or 0))
+            if _best_area is None or area <= _best_area:
+                _best_area = area
                 hit = d
-                break
 
         if not hit:
             # 退而求其次：扫描页面内容流，找包含点击点的路径块。
@@ -4152,9 +4160,22 @@ class UltraAppFinal(QMainWindow):
             QMessageBox.warning(self, "错误", f"构造对话框失败: {e}\n{tb}")
             return
 
-        # 自动填充颜色
+        # 自动填充颜色 + 日志（让用户能看到到底选中了哪个图元/颜色）
+        try:
+            _f = hit.get('fill')
+            _s2 = hit.get('color') if isinstance(hit, dict) else None
+            _r2 = hit.get('rect')
+            self.add_log(
+                f">>> 选中路径: 填充={tuple(round(v,3) for v in _f) if _f else None} "
+                f"描边={tuple(round(v,3) for v in _s2) if _s2 else None} "
+                f"面积={abs((_r2.width or 0)*(_r2.height or 0)):.0f}"
+            )
+        except Exception:
+            pass
         if fill_color:
             dlg.fill_row.set_color(fill_color)
+        elif hit.get('fill'):
+            dlg.fill_row.set_color(tuple(hit['fill']))
 
         if dlg.exec() != dlg.DialogCode.Accepted:
             return
