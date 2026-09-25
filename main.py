@@ -2030,6 +2030,10 @@ class MasterWorker(QThread):
                     final_img_candidates[h]['xrefs'].add(img['xref'])
                 for t in p['texts']:
                     _txt = str(t.get('text') or '')
+                    # 过滤乱码候选（U+FFFD）：字体 CMap 缺失导致的占位字符，
+                    # 列出后无法定位也无法删除，属于列表噪声。
+                    if '\ufffd' in _txt:
+                        continue
                     if len(_txt) <= 1:
                         # 单字符候选：只有字号显著大于正文主流字号才保留
                         try:
