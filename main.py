@@ -2422,6 +2422,24 @@ class MasterWorker(QThread):
             if confirmed_xrefs:
                 img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
                 img_removed = _dw.remove_image_watermarks(pdf, img_cand)
+                if img_removed == 0 and img_cand:
+                    # 勾了但一条 Do 都没删：给出可执行的解释（而不是静默 0）
+                    _sm = {}
+                    try:
+                        if hasattr(_dw, 'find_smask_parents'):
+                            _sm = _dw.find_smask_parents(pdf, img_cand)
+                    except Exception:
+                        _sm = {}
+                    if _sm:
+                        self.log_signal.emit(
+                            ">>> WARNING 勾选的图片是其它图片的 /SMask（软掩码），它不被 /Do 绘制，"
+                            "无法按删除引用的方式移除。请改选对应的彩色图，或用『图像水印』按 DPI 删除。"
+                        )
+                    else:
+                        self.log_signal.emit(
+                            ">>> WARNING 勾选的图片在页面/Form 内容流里没有绘制引用"
+                            "（可能是内联图像或仅作掩码），本次未删除。"
+                        )
 
         # ---- Adobe 字符级水印删除（用户勾选时）----
         adobe_bdc_removed = 0

@@ -992,42 +992,195 @@ def _names_to_remove(res, cand, seen_forms):
     return names
 
 
+def _strip_do_names(data: bytes, names) -> tuple:
+    """从一段内容流里删除命中名字的 `/Name Do`，返回 (新流, 删除数)。"""
+    removed = 0
+    for nm in names:
+        try:
+            nm_b = nm.lstrip('/').encode('latin-1')
+        except Exception:
+            continue
+        pat = re.compile(rb'/' + re.escape(nm_b) + rb"(?![A-Za-z0-9])[ \t\r\n]*Do\b")
+        data, k = pat.subn(b'', data)
+        removed += k
+    return data, removed
+
+
+def find_smask_parents(pdf, cand):
+    """返回 {候选objgen: [父图objgen...]} —— 候选若是某图的 /SMask，就无法用 Do 删除
+    （它不被绘制，只作为掩码），调用方可据此给出明确提示。"""
+    out = {}
+    if not cand:
+        return out
+    try:
+        objs = list(pdf.objects)
+    except Exception:
+        return out
+    for obj in objs:
+        try:
+            if not isinstance(obj, pikepdf.Stream):
+                continue
+            if str(obj.get('/Subtype')) != '/Image':
+                continue
+            sm = obj.get('/SMask')
+            if sm is None:
+                continue
+            sog = sm.objgen
+            if sog in cand:
+                out.setdefault(sog, []).append(obj.objgen)
+        except Exception:
+            continue
+    return out
+
+
+def _names_local(res, cand, cache, walked_forms):
+    """只看 res 的**直接** XObject 条目，返回该作用域内应删的名字集合。
+
+    规则：
+      - 图片 objgen 命中候选 → 删
+      - Form 若其 objgen 命中候选，或它的叶子图非空且全部命中候选
+        （纯包装容器，兼容"水印图被包在 Form 里"）→ 删该 Form 的名字
+    不递归：递归由调用方按层处理，保证每个流都用自己作用域的名字。
+    cache: {(form_objgen): bool 是否容器} 跨页复用判定结果
+    """
+    names = set()
+    if res is None:
+        return names
+    try:
+        xo = res.get('/XObject')
+    except Exception:
+        xo = None
+    if xo is None:
+        return names
+    for name, obj in list(xo.items()):
+        try:
+            sub = str(obj.get('/Subtype'))
+        except Exception:
+            continue
+        try:
+            g = obj.objgen
+        except Exception:
+            continue
+        if sub == '/Image':
+            if g in cand:
+                names.add(name)
+        elif sub == '/Form':
+            is_wrapper = cache.get(g)
+            if is_wrapper is None:
+                if g in walked_forms:
+                    continue
+                walked_forms.add(g)
+                try:
+                    inner, _ = _leaf_image_refs(obj.read_bytes(), obj.get('/Resources'), {g})
+                except Exception:
+                    inner = set()
+                is_wrapper = bool(g in cand or (inner and inner <= cand))
+                cache[g] = is_wrapper
+            if is_wrapper:
+                names.add(name)
+    return names
+
+
 def remove_image_watermarks(pdf, cand) -> int:
-    """删除各页绘制候选图片/包装 Form 的 /name Do 操作与资源项。
-    返回删除的 Do 操作数。"""
+    """删除绘制候选图片（或纯包装 Form）的 /name Do，返回删除的 Do 数。
+
+    历史坑：水印图常画在 Form XObject 内部（页面只 `/Fm0 Do` 一次，
+    图片的 `/ImX Do` 在 Form 自己的流里，且该 Form 可能还含正文图）。
+    旧实现只从**页面**流里删名字，于是这种情况删除数恒为 0（能找到但删不掉）。
+    现在按作用域递归处理：页面流用页面资源名，每个 Form 的流用该 Form 的资源名。
+    """
     total = 0
+    cache = {}
+    walked_forms = set()
+
+    def strip_stream(obj, names):
+        nonlocal total
+        if obj is None or not names:
+            return 0
+        try:
+            data = obj.read_bytes()
+        except Exception:
+            return 0
+        new, k = _strip_do_names(data, names)
+        if k:
+            try:
+                obj.write(new)
+                total += k
+            except Exception:
+                return 0
+        return k
+
+    def walk(res, depth=0):
+        """递归处理 res 下每个 Form 的内部流"""
+        if res is None or depth > 20:
+            return
+        try:
+            xo = res.get('/XObject')
+        except Exception:
+            xo = None
+        if xo is None:
+            return
+        for name, obj in list(xo.items()):
+            try:
+                if str(obj.get('/Subtype')) != '/Form':
+                    continue
+            except Exception:
+                continue
+            try:
+                fres = obj.get('/Resources')
+            except Exception:
+                fres = None
+            names = _names_local(fres, cand, cache, walked_forms)
+            if names:
+                strip_stream(obj, names)
+                # 顺手清掉该 Form 资源里已不再被绘制的条目
+                try:
+                    fxo = fres.get('/XObject') if fres is not None else None
+                    if fxo is not None:
+                        for nm in list(names):
+                            if nm in fxo:
+                                try:
+                                    del fxo[nm]
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+            walk(fres, depth + 1)
+
     for page in pdf.pages:
         res = page.get('/Resources')
-        names = _names_to_remove(res, cand, set())
-        if not names:
-            continue
+        # 1) 页面内容流（用页面作用域的名字）
+        try:
+            names_page = _names_local(res, cand, cache, walked_forms)
+        except Exception:
+            names_page = set()
         contents = page.Contents
-        if contents is not None:
+        if contents is not None and names_page:
             streams = contents if isinstance(contents, pikepdf.Array) else [contents]
             keep = pikepdf.Array()
-            for s in streams:
-                if s is None:
-                    keep.append(s)
+            for st in streams:
+                if st is None:
+                    keep.append(st)
                     continue
-                data = s.read_bytes()
-                new_data = data
-                for nm in names:
-                    nm_b = nm.lstrip('/').encode('latin-1')
-                    pat = re.compile(rb'/' + re.escape(nm_b) +
-                             rb"(?![A-Za-z0-9])[ \t\r\n]*Do\b")
-                    new_data, k = pat.subn(b'', new_data)
-                    total += k
-                if new_data != data:
-                    s.write(new_data)
-                keep.append(s)
+                strip_stream(st, names_page)
+                keep.append(st)
             if isinstance(contents, pikepdf.Array):
                 page.Contents = keep
-        if res is not None:
-            xo = res.get('/XObject')
-            if xo is not None:
-                for nm in names:
-                    if nm in xo:
-                        del xo[nm]
+        # 2) 所有 Form 内部流（递归）
+        walk(res)
+        # 3) 清理页面资源里命中候选/容器的条目
+        if res is not None and names_page:
+            try:
+                xo = res.get('/XObject')
+                if xo is not None:
+                    for nm in list(names_page):
+                        if nm in xo:
+                            try:
+                                del xo[nm]
+                            except Exception:
+                                pass
+            except Exception:
+                pass
     return total
 
 
