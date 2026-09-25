@@ -703,6 +703,44 @@ def analyze_chunk_worker(file_path, page_indices):
     return results, errors
 
 
+def rebind_hashes_to_xrefs(path, wanted_hashes, size_hint=None, log=None):
+    """按内容哈希在当前文件上重新解析图片 xref。
+
+    为什么需要：Form 拍平后会 save + 重新打开，pikepdf 会重排对象编号
+    （实测某水印图 xref 59 变成 31），此时再按分析阶段记下的旧 xref 去
+    find_image_objgens 会返回空集 → 图片水印的 Do 引用删除恒为 0（删不掉）。
+    按内容哈希重新解析即可恢复正确映射。
+
+    size_hint: 可选的 {(w, h), ...}，先用尺寸过滤，避免对整本扫描件哈希所有图。
+    """
+    found = set()
+    if not wanted_hashes:
+        return found
+    try:
+        import pymupdf as _f
+    except ImportError:
+        import pymupdf as _f
+    try:
+        d = _f.open(path)
+        for pg in d:
+            for img in pg.get_images(full=True):
+                try:
+                    if size_hint and (int(img[2]), int(img[3])) not in size_hint:
+                        continue
+                    if _pix_hash(_f.Pixmap(d, img[0])) in wanted_hashes:
+                        found.add(int(img[0]))
+                except Exception:
+                    continue
+        d.close()
+    except Exception as e:
+        if log:
+            try:
+                log(f">>> image xref rebind failed: {e}")
+            except Exception:
+                pass
+    return found
+
+
 def _scan_pages(fitz, file_path, page_indices, doc=None):
     """扫描一组页。**每个 worker 线程独立 fitz.open**——PyMuPDF 的 Document
     不是线程安全的，多线程共享同一 doc 会触发内部状态竞争。
@@ -2222,6 +2260,14 @@ class MasterWorker(QThread):
         # 用分析阶段记下的 xref，禁止再算一遍哈希（大图分析用 samples[::4]，
         # 旧删除路径用完整 samples，哈希对不上 → 勾了却删不掉）
         ic_set = set(ic)
+        # 勾选图片候选的尺寸集合：用于哈希重定位与残留校验时先按尺寸过滤，避免全量哈希
+        _size_hint = set()
+        for _h, _info in final_img_candidates.items():
+            if _h in ic_set:
+                try:
+                    _size_hint.add((int(_info.get('w') or 0), int(_info.get('h') or 0)))
+                except Exception:
+                    pass
         confirmed_xrefs = set()
         for h, info in final_img_candidates.items():
             if h in ic_set:
@@ -2364,9 +2410,18 @@ class MasterWorker(QThread):
                 pass
 
         img_removed = 0
-        if confirmed_xrefs:
-            img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
-            img_removed = _dw.remove_image_watermarks(pdf, img_cand)
+        if ic_set:
+            # 拍平/保存后对象编号会变（实测 59 → 31），旧 xref 失效会让删除恒为 0。
+            # 按内容哈希在当前工作副本上重新解析 xref。
+            _reb = rebind_hashes_to_xrefs(fpath, ic_set, _size_hint, log=self.log_signal.emit)
+            if _reb and _reb != confirmed_xrefs:
+                self.log_signal.emit(
+                    f">>> Image xrefs rebound by hash: {sorted(confirmed_xrefs)[:6]} -> {sorted(_reb)[:6]}"
+                )
+                confirmed_xrefs = _reb
+            if confirmed_xrefs:
+                img_cand = _dw.find_image_objgens(pdf, confirmed_xrefs)
+                img_removed = _dw.remove_image_watermarks(pdf, img_cand)
 
         # ---- Adobe 字符级水印删除（用户勾选时）----
         adobe_bdc_removed = 0
@@ -2482,7 +2537,18 @@ class MasterWorker(QThread):
                 t = pg.get_text()
                 if _resid_kw and any(k.decode('utf-8', 'replace').lower() in t.lower() for k in _resid_kw):
                     resid += 1
-            left_imgs = [g for pg in chk for g in pg.get_images(full=True) if g[0] in confirmed_xrefs]
+            # 残留校验按内容哈希：保存会重排对象编号，按 xref 编号比对会产生假残留
+            left_imgs = []
+            if ic_set:
+                for pg in chk:
+                    for g in pg.get_images(full=True):
+                        try:
+                            if _size_hint and (int(g[2]), int(g[3])) not in _size_hint:
+                                continue
+                            if _pix_hash(fitz.Pixmap(chk, g[0])) in ic_set:
+                                left_imgs.append(g[0])
+                        except Exception:
+                            continue
             chk.close()
         except Exception:
             pass
@@ -3088,8 +3154,10 @@ class DpiWmWorker(QThread):
             # 3. 保存到临时文件
             # 输出路径：始终另存为新文件（不覆盖源文件）
             self.progress.emit(90)
-            base, ext = os.path.splitext(self.file_path)
-            out_path = base + "_dpi" + ext
+            # 中间结果写系统临时目录，绝不落在源文件所在文件夹
+            # （源目录只在用户点「保存」时才写入）
+            _stem = os.path.splitext(os.path.basename(self.file_path))[0]
+            out_path = os.path.join(tempfile.gettempdir(), f"{_stem}_dpi.pdf")
             tmp_path = out_path + ".tmp"
 
             try:
